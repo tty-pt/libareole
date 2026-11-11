@@ -882,7 +882,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			float dz = p_far[2] - p_near[2];
 
 			if (fabsf(dz) > 1e-6f) {
-				float t0 = -p_near[2] / dz;
+				float z_mid = (eff_z_min + eff_z_max) * 0.5f;
+				float t0 = (z_mid - p_near[2]) / dz;
 				if (t0 >= -0.2f && t0 <= 1.2f) {
 					float ix = p_near[0] + t0 * dx;
 					float iy = p_near[1] + t0 * dy;
