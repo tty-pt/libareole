@@ -1,0 +1,39 @@
+{
+  "name": "@tty-pt/areole",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Universal Node.js and Browser WebAssembly bindings for libareole generic distance-adaptive multi-scale spatial quadtree and LOD hierarchy",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "include",
+    "*.pc",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:wasm": "make -C .. wasm",
+    "build": "npm run build:wasm",
+    "test": "node --test tests/areole.test.mjs"
+  },
+  "peerDependencies": {
+    "@tty-pt/stele": ">=1.5.0"
+  },
+  "devDependencies": {
+    "@tty-pt/stele": "^1.5.2"
+  },
+  "keywords": [
+    "areole",
+    "spatial",
+    "quadtree",
+    "clipmap",
+    "lod",
+    "terrain",
+    "wasm",
+    "webassembly",
+    "multi-scale"
+  ],
+  "author": "Paulo Quirino <q@qnixsoft.com>",
+  "license": "BSD-2-Clause"
+}

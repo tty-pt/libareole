@@ -1,0 +1,8 @@
+bin/
+lib/
+obj/
+*.o
+*.so
+*.a
+npm/node_modules/
+npm/build/

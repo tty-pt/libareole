@@ -1,0 +1,10 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: areole
+Description: Generic Distance-Adaptive Multi-Scale Spatial Quadtree & LOD Engine
+Version: 1.0.0
+Libs: -L${libdir} -lareole -lm
+Cflags: -I${includedir}
