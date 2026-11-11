@@ -6,7 +6,6 @@
 #include <time.h>
 
 #include "ttypt/areole.h"
-#include "ttypt/chunk.h"
 
 /* Pure analytical multi-octave procedural sampler (zero libchaff dependency) */
 static void analytical_multioctave_sampler(void *user_ctx, uint16_t world, uint8_t level,
@@ -338,10 +337,10 @@ int main(void)
 
 	/* Test 7: Ergonomic Shorthand & Legacy chunk_* Alias Compatibility */
 	{
-		chunk_system_t *simple_cs = chunk_create(160, 128, mock_sampler, NULL);
+		ar_system_t *simple_cs = ar_create(160, 128, mock_sampler, NULL);
 		assert(simple_cs != NULL);
 
-		chunk_view_t view = {
+		ar_view_t view = {
 			.cam_x = 0.0f, .cam_y = 0.0f, .cam_z = 0.0f,
 			.pitch = 0.0f, .yaw = 0.0f, .fov = 0.0f,
 			.zoom = 1.0f,
@@ -349,19 +348,19 @@ int main(void)
 			.eff_cam_dist = 400.0f
 		};
 
-		const chunk_node_t *out_nodes[CHUNK_MAX_ACTIVE];
-		size_t active_count = chunk_update(simple_cs, 1, &view, out_nodes, CHUNK_MAX_ACTIVE);
-		assert(active_count > 0 && active_count <= CHUNK_MAX_ACTIVE);
+		const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
+		size_t active_count = ar_update(simple_cs, 1, &view, out_nodes, AR_DEFAULT_MAX_ACTIVE);
+		assert(active_count > 0 && active_count <= AR_DEFAULT_MAX_ACTIVE);
 
-		chunk_sample_t probe_sample;
-		bool probe_ok = chunk_probe(simple_cs, 1, 0, 0, &probe_sample);
+		ar_sample_t probe_sample;
+		bool probe_ok = ar_probe(simple_cs, 1, 0, 0, &probe_sample);
 		assert(probe_ok);
-		float probe_elev_f = chunk_elevation_to_float(probe_sample.val);
-		int16_t roundtrip_q = chunk_elevation_from_float(probe_elev_f);
+		float probe_elev_f = ar_elevation_to_float(probe_sample.val);
+		int16_t roundtrip_q = ar_elevation_from_float(probe_elev_f);
 		assert(abs(roundtrip_q - probe_sample.val) <= 1);
 
-		chunk_clear(simple_cs);
-		chunk_destroy(simple_cs);
+		ar_clear(simple_cs);
+		ar_destroy(simple_cs);
 		printf("  [PASS] Ergonomic shorthand API and legacy chunk_* aliases verified\n");
 	}
 

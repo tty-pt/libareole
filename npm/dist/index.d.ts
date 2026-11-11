@@ -1,4 +1,4 @@
-export interface ChunkSample {
+export interface AreoleSample {
   elevation: number;
   biome: number;
   biome2: number;
@@ -7,7 +7,7 @@ export interface ChunkSample {
   flags: number;
 }
 
-export interface ChunkNodeSummary {
+export interface AreoleNodeSummary {
   ox: number;
   oy: number;
   w: number;
@@ -18,7 +18,7 @@ export interface ChunkNodeSummary {
   maxElevation: number;
 }
 
-export interface ChunkView {
+export interface AreoleView {
   camX: number;
   camY: number;
   camZ?: number;
@@ -31,12 +31,12 @@ export interface ChunkView {
   effCamDist?: number;
 }
 
-export interface ChunkSystem {
-  update(view: ChunkView, world?: number): ChunkNodeSummary[];
-  probe(wx: number, wy: number, world?: number): ChunkSample | null;
+export interface AreoleSystem {
+  update(view: AreoleView, world?: number): AreoleNodeSummary[];
+  probe(wx: number, wy: number, world?: number): AreoleSample | null;
   clear(): void;
   destroy(): void;
 }
 
-export function getChunkWasm(): any;
-export function createChunkSystem(baseW?: number, baseH?: number): ChunkSystem;
+export function getAreoleWasm(): any;
+export function createAreoleSystem(baseW?: number, baseH?: number): AreoleSystem;

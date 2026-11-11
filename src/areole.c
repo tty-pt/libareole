@@ -5,7 +5,6 @@
 
 #include "ttypt/morton.h"
 #include "ttypt/areole.h"
-#include "ttypt/chunk.h"
 #include "ttypt/islet_quad.h"
 
 /* Floor division for integer coordinate lattices */
@@ -823,10 +822,6 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		z_min = -2000.0f;
 		z_max = 2000.0f;
 	}
-	float eff_z_min = z_min;
-	if (sag_r > 0.0f) eff_z_min -= sag_r;
-	float eff_z_max = z_max;
-
 	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
 	float focal_pt[4] = { fx, fy, 0.0f, 1.0f };
 	float focal_clip[4];
@@ -837,6 +832,14 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		               mvp[3 * 4 + i] * focal_pt[3];
 	}
 	float dist = (is_perspective && focal_clip[3] > 0.01f) ? fabsf(focal_clip[3]) : 1.0f;
+
+	float eff_z_min = z_min;
+	if (sag_r > 0.0f) {
+		float max_sag = is_perspective ? ((dist * 1.5f < sag_r) ? (dist * 1.5f) : sag_r) : sag_r;
+		eff_z_min -= max_sag;
+	}
+	float eff_z_max = z_max;
+	float max_ray_span = is_perspective ? ((dist * 6.0f > 2000.0f) ? (dist * 6.0f) : 2000.0f) : 100000000.0f;
 
 	float len_row0 = sqrtf(mvp[0]*mvp[0] + mvp[4]*mvp[4] + mvp[8]*mvp[8]);
 	float len_row1 = sqrtf(mvp[1]*mvp[1] + mvp[5]*mvp[5] + mvp[9]*mvp[9]);
@@ -903,6 +906,12 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 						if (t >= -0.2f && t <= 1.2f) {
 							float ix = p_near[0] + t * dx;
 							float iy = p_near[1] + t * dy;
+							if (is_perspective) {
+								if (ix < fx - max_ray_span) ix = fx - max_ray_span;
+								if (ix > fx + max_ray_span) ix = fx + max_ray_span;
+								if (iy < fy - max_ray_span) iy = fy - max_ray_span;
+								if (iy > fy + max_ray_span) iy = fy + max_ray_span;
+							}
 							if (ix >= -100000000.0f && ix <= 100000000.0f &&
 							    iy >= -100000000.0f && iy <= 100000000.0f) {
 								if (ix < bb_min_x) bb_min_x = ix;
@@ -1384,117 +1393,4 @@ void ar_system_get_stats(const ar_system_t *sys, ar_stats_t *out_stats)
 	if (!sys || !out_stats)
 		return;
 	*out_stats = sys->stats;
-}
-
-/* ========================================================================= */
-/* Legacy chunk_* ABI Symbol Exports (for shared library compatibility)      */
-/* ========================================================================= */
-
-#undef chunk_system_create_ex
-#undef chunk_system_create
-#undef chunk_system_destroy
-#undef chunk_system_clear
-#undef chunk_system_begin_frame
-#undef chunk_system_eval_view
-#undef chunk_mat4_identity
-#undef chunk_mat4_multiply
-#undef chunk_mat4_ortho
-#undef chunk_mat4_perspective
-#undef chunk_mat4_lookat
-#undef chunk_mat4_lookat_lh
-#undef chunk_mat4_invert
-#undef chunk_frustum_from_matrix
-#undef chunk_frustum_test_box
-#undef chunk_system_query_matrix
-#undef chunk_system_query_modelview_projection
-#undef chunk_system_update
-#undef chunk_system_probe
-#undef chunk_system_find
-#undef chunk_system_find_by_key
-#undef chunk_system_ensure
-#undef chunk_system_get_stats
-
-ar_system_t *chunk_system_create(int32_t base_w, int32_t base_h,
-                                 ar_sampler_fn sampler,
-                                 ar_sparsity_fn sparsity,
-                                 void *user_ctx)
-{
-	return ar_system_create(base_w, base_h, sampler, sparsity, user_ctx);
-}
-
-void chunk_system_destroy(ar_system_t *cs) { ar_system_destroy(cs); }
-void chunk_system_clear(ar_system_t *cs) { ar_system_clear(cs); }
-void chunk_system_begin_frame(ar_system_t *cs) { ar_system_begin_frame(cs); }
-
-size_t chunk_system_eval_view(ar_system_t *cs, uint8_t view_id, uint16_t world,
-                              const ar_view_t *view,
-                              ar_draw_item_t *out_items,
-                              size_t max_items)
-{
-	return ar_system_eval_view(cs, view_id, world, view, out_items, max_items);
-}
-
-void chunk_mat4_identity(float out[16]) { ar_mat4_identity(out); }
-void chunk_mat4_multiply(float out[16], const float a[16], const float b[16]) { ar_mat4_multiply(out, a, b); }
-void chunk_mat4_ortho(float out[16], float l, float r, float b, float t, float n, float f) { ar_mat4_ortho(out, l, r, b, t, n, f); }
-void chunk_mat4_perspective(float out[16], float fov, float asp, float n, float f) { ar_mat4_perspective(out, fov, asp, n, f); }
-void chunk_mat4_lookat(float out[16], const float eye[3], const float target[3], const float up[3]) { ar_mat4_lookat(out, eye, target, up); }
-bool chunk_mat4_invert(float out[16], const float m[16]) { return ar_mat4_invert(out, m); }
-void chunk_frustum_from_matrix(ar_frustum_t *f, const float mvp[16]) { ar_frustum_from_matrix(f, mvp); }
-bool chunk_frustum_test_box(const ar_frustum_t *f, float x0, float y0, float z0, float x1, float y1, float z1) { return ar_frustum_test_box(f, x0, y0, z0, x1, y1, z1); }
-
-size_t chunk_system_query_matrix(ar_system_t *cs, uint16_t world,
-                                 const float mvp[16],
-                                 const ar_cull_opts_t *opts,
-                                 const ar_node_t **out_chunks,
-                                 size_t max_out)
-{
-	return ar_system_query_matrix(cs, world, mvp, opts, out_chunks, max_out);
-}
-
-size_t chunk_system_query_modelview_projection(ar_system_t *cs, uint16_t world,
-                                               const float modelview[16],
-                                               const float projection[16],
-                                               const ar_cull_opts_t *opts,
-                                               const ar_node_t **out_chunks,
-                                               size_t max_out)
-{
-	return ar_system_query_modelview_projection(cs, world, modelview, projection, opts, out_chunks, max_out);
-}
-
-size_t chunk_system_update(ar_system_t *cs, uint16_t world,
-                           const ar_view_t *view,
-                           const ar_node_t **out_chunks,
-                           size_t max_out)
-{
-	return ar_system_update(cs, world, view, out_chunks, max_out);
-}
-
-bool chunk_system_probe(ar_system_t *cs, uint16_t world,
-                        int32_t wx, int32_t wy,
-                        ar_sample_t *out)
-{
-	return ar_system_probe(cs, world, wx, wy, out);
-}
-
-const ar_node_t *chunk_system_find(ar_system_t *cs, uint16_t world,
-                                   uint8_t level, int32_t ox, int32_t oy)
-{
-	return ar_system_find(cs, world, level, ox, oy);
-}
-
-const ar_node_t *chunk_system_find_by_key(ar_system_t *cs, uint64_t morton_key)
-{
-	return ar_system_find_by_key(cs, morton_key);
-}
-
-const ar_node_t *chunk_system_ensure(ar_system_t *cs, uint16_t world,
-                                     uint8_t level, int32_t ox, int32_t oy)
-{
-	return ar_system_ensure(cs, world, level, ox, oy);
-}
-
-void chunk_system_get_stats(const ar_system_t *cs, ar_stats_t *out_stats)
-{
-	ar_system_get_stats(cs, out_stats);
 }

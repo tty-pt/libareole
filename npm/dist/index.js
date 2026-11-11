@@ -8,7 +8,6 @@ export function getAreoleWasm() {
   return wasmInstance;
 }
 
-export const getChunkWasm = getAreoleWasm;
 
 export function createAreoleSystem(baseW = 160, baseH = 128) {
   const wasm = getAreoleWasm();
@@ -104,4 +103,3 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
   };
 }
 
-export const createChunkSystem = createAreoleSystem;

@@ -15,23 +15,15 @@ WASM_LDFLAGS ?= -mexec-model=reactor -Wl,--gc-sections -Wl,--no-entry -Wl,--allo
 	-Wl,--export=ar_wasm_update \
 	-Wl,--export=ar_wasm_probe \
 	-Wl,--export=ar_wasm_get_node_ptr \
-	-Wl,--export=ar_wasm_get_node_count \
-	-Wl,--export=chunk_wasm_create \
-	-Wl,--export=chunk_wasm_destroy \
-	-Wl,--export=chunk_wasm_clear \
-	-Wl,--export=chunk_wasm_update \
-	-Wl,--export=chunk_wasm_probe \
-	-Wl,--export=chunk_wasm_get_node_ptr \
-	-Wl,--export=chunk_wasm_get_node_count
+	-Wl,--export=ar_wasm_get_node_count
 
 NPM ?= npm
 
 all: lib/libareole.so test wasm
 
-lib/libareole.so: src/areole.c include/ttypt/areole.h include/ttypt/chunk.h
+lib/libareole.so: src/areole.c include/ttypt/areole.h
 	@mkdir -p lib
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ src/areole.c $(LDLIBS)
-	@ln -sf libareole.so lib/libchunk.so
 
 test: bin/test_areole bin/test_glsl
 	./bin/test_areole
@@ -41,7 +33,7 @@ bin/test_areole: tests/test_areole.c src/areole.c include/ttypt/areole.h
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ tests/test_areole.c src/areole.c $(LDLIBS)
 
-bin/test_glsl: tests/test_glsl.c include/ttypt/areole_glsl.h include/ttypt/chunk_glsl.h
+bin/test_glsl: tests/test_glsl.c include/ttypt/areole_glsl.h
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ tests/test_glsl.c $(LDLIBS)
 
@@ -65,11 +57,10 @@ install: lib/libareole.so areole.pc
 	install -d $(DESTDIR)$(PREFIX)/include/ttypt
 	install -m 644 include/ttypt/areole.h $(DESTDIR)$(PREFIX)/include/ttypt/
 	install -m 644 include/ttypt/areole_glsl.h $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -m 644 include/ttypt/chunk.h $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -m 644 include/ttypt/chunk_glsl.h $(DESTDIR)$(PREFIX)/include/ttypt/
+	install -m 644 $(DESTDIR)$(PREFIX)/include/ttypt/
+	install -m 644 $(DESTDIR)$(PREFIX)/include/ttypt/
 	install -d $(DESTDIR)$(PREFIX)/lib
 	install -m 755 lib/libareole.so $(DESTDIR)$(PREFIX)/lib/
-	ln -sf libareole.so $(DESTDIR)$(PREFIX)/lib/libchunk.so
 	install -d $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	install -m 644 areole.pc $(DESTDIR)$(PREFIX)/lib/pkgconfig/
 

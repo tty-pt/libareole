@@ -76,21 +76,3 @@ ISO_EXPORT(int32_t, ar_wasm_probe, ar_system_t *sys, uint32_t world, int32_t wx,
 	if (!sys || !out) return 0;
 	return ar_system_probe(sys, (uint16_t)world, wx, wy, out) ? 1 : 0;
 }
-
-/* Legacy chunk_wasm_* aliases */
-ISO_EXPORT(ar_system_t *, chunk_wasm_create, int32_t base_w, int32_t base_h) {
-	return ar_wasm_create(base_w, base_h);
-}
-ISO_EXPORT(void, chunk_wasm_destroy, ar_system_t *sys) { ar_wasm_destroy(sys); }
-ISO_EXPORT(void, chunk_wasm_clear, ar_system_t *sys) { ar_wasm_clear(sys); }
-ISO_EXPORT(uint32_t, chunk_wasm_update, ar_system_t *sys, uint32_t world,
-                          float cam_x, float cam_y, float cam_z,
-                          float pitch, float yaw, float fov,
-                          float zoom, float vp_w, float vp_h, float eff_dist) {
-	return ar_wasm_update(sys, world, cam_x, cam_y, cam_z, pitch, yaw, fov, zoom, vp_w, vp_h, eff_dist);
-}
-ISO_EXPORT(uint32_t, chunk_wasm_get_node_count, void) { return ar_wasm_get_node_count(); }
-ISO_EXPORT(const ar_node_t *, chunk_wasm_get_node_ptr, uint32_t index) { return ar_wasm_get_node_ptr(index); }
-ISO_EXPORT(int32_t, chunk_wasm_probe, ar_system_t *sys, uint32_t world, int32_t wx, int32_t wy, ar_sample_t *out) {
-	return ar_wasm_probe(sys, world, wx, wy, out);
-}

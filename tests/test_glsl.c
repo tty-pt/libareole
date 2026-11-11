@@ -6,7 +6,6 @@
 #include <math.h>
 
 #include "ttypt/areole_glsl.h"
-#include "ttypt/chunk_glsl.h"
 
 int main(void)
 {
@@ -40,10 +39,10 @@ int main(void)
 		assert(strstr(src, "ar_apply_spherical_sag") != NULL);
 		assert(strstr(src, "ar_project") != NULL);
 
-		const char *csrc = chunk_glsl_source();
+		const char *csrc = ar_glsl_source();
 		assert(csrc != NULL);
-		assert(strstr(csrc, "chunk_uv_to_world") != NULL);
-		printf("  [PASS] ar_glsl_source and chunk_glsl_source verified\n");
+		assert(strstr(csrc, "ar_uv_to_world") != NULL);
+		printf("  [PASS] ar_glsl_source and ar_glsl_source verified\n");
 	}
 
 	/* 3. ar_glsl_ref_uv_to_world float parity */
