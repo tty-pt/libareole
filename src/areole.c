@@ -724,16 +724,13 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 
 	/* 4. Evaluate sample grid: (grid_dim + 1) x (grid_dim + 1) vertices */
 	int32_t gdim = (int32_t)sys->grid_dim;
-	int32_t step_x = node->w / gdim;
-	int32_t step_y = node->h / gdim;
-	if (step_x < 1) step_x = 1;
-	if (step_y < 1) step_y = 1;
+	if (gdim < 1) gdim = 1;
 
 	size_t idx = 0;
 	for (int r = 0; r <= gdim; r++) {
-		int32_t wy = oy + r * step_y;
+		int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
 		for (int c = 0; c <= gdim; c++) {
-			int32_t wx = ox + c * step_x;
+			int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
 			ar_sample_t *s = &node->samples[idx];
 			sys->sampler(sys->user_ctx, world, level, wx, wy, s);
 			sys->stats.sampler_invocations_total++;

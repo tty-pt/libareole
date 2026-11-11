@@ -803,6 +803,45 @@ int main(void)
 		printf("  [PASS] Generic sample data integrity (val, rgba, attr[0..7], flags) verified\n");
 	}
 
+	/* Test 17: Non-divisible grid_dim (48 on 160x128) exact boundary seam continuity */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.max_levels = 4;
+		cfg.grid_dim = 48;
+		cfg.pool_capacity = 64;
+		cfg.max_active = 32;
+		cfg.sampler = mock_sampler;
+
+		ar_system_t *hd_cs = ar_system_create_ex(&cfg);
+		assert(hd_cs != NULL);
+
+		const ar_node_t *n00 = ar_system_ensure(hd_cs, 1, 0, 0, 0);
+		const ar_node_t *n10 = ar_system_ensure(hd_cs, 1, 0, 160, 0);
+		const ar_node_t *n01 = ar_system_ensure(hd_cs, 1, 0, 0, 128);
+		assert(n00 != NULL && n10 != NULL && n01 != NULL);
+		assert(n00->grid_dim == 48 && n00->vert_dim == 49 && n00->vert_count == 2401);
+
+		/* Right edge of (0,0) at c=48 must match left edge of (160,0) at c=0 */
+		for (uint32_t r = 0; r < n00->vert_dim; r++) {
+			int16_t left_chunk_right_edge = n00->values[r * n00->vert_dim + 48];
+			int16_t right_chunk_left_edge = n10->values[r * n10->vert_dim + 0];
+			assert(left_chunk_right_edge == right_chunk_left_edge);
+		}
+
+		/* Bottom edge of (0,0) at r=48 must match top edge of (0,128) at r=0 */
+		for (uint32_t c = 0; c < n00->vert_dim; c++) {
+			int16_t top_chunk_bottom_edge = n00->values[48 * n00->vert_dim + c];
+			int16_t bottom_chunk_top_edge = n01->values[0 * n01->vert_dim + c];
+			assert(top_chunk_bottom_edge == bottom_chunk_top_edge);
+		}
+
+		ar_destroy(hd_cs);
+		printf("  [PASS] Non-divisible grid_dim=48 on 160x128 bounds exact seam continuity verified\n");
+	}
+
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;
 }
