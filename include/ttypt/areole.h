@@ -234,6 +234,7 @@ typedef struct {
 	float        viewport_h;        /* Viewport height in pixels */
 	uint8_t      min_level;         /* Minimum LOD level clamp */
 	uint8_t      max_level;         /* Maximum LOD level clamp */
+	uint8_t      view_id;           /* View slot identifier (0..7) for multi-view active mask */
 	ar_bounds_fn bounds_fn;         /* Optional generic vertical envelope callback */
 	void        *bounds_ctx;        /* Opaque context passed to bounds_fn */
 } ar_cull_opts_t;
@@ -281,6 +282,11 @@ size_t ar_system_eval_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
                            ar_draw_item_t *out_items,
                            size_t max_items);
 
+size_t ar_system_eval_ortho(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                            float center_x, float center_y,
+                            float world_w, float world_h,
+                            float viewport_w, float viewport_h);
+
 /*
  * Matrix Utility Functions (Zero-Dependency Pure C):
  * Column-major 4x4 matrix mathematics matching standard right-handed WebGL / OpenGL conventions.
@@ -323,6 +329,10 @@ size_t ar_system_update(ar_system_t *sys, uint16_t world,
 bool ar_system_probe(ar_system_t *sys, uint16_t world,
                      int32_t wx, int32_t wy,
                      ar_sample_t *out);
+
+bool ar_system_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                          int32_t wx, int32_t wy,
+                          ar_sample_t *out);
 
 const ar_node_t *ar_system_find(ar_system_t *sys, uint16_t world,
                                 uint8_t level, int32_t ox, int32_t oy);
@@ -369,6 +379,15 @@ static inline size_t ar_eval_view(ar_system_t *sys, uint8_t view_id, uint16_t wo
 	return ar_system_eval_view(sys, view_id, world, view, out_items, max_items);
 }
 
+static inline size_t ar_eval_ortho(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                                   float center_x, float center_y,
+                                   float world_w, float world_h,
+                                   float viewport_w, float viewport_h)
+{
+	return ar_system_eval_ortho(sys, view_id, world, center_x, center_y,
+	                            world_w, world_h, viewport_w, viewport_h);
+}
+
 static inline size_t ar_update(ar_system_t *sys, uint16_t world,
                                const ar_view_t *view,
                                const ar_node_t **out_nodes,
@@ -382,6 +401,13 @@ static inline bool ar_probe(ar_system_t *sys, uint16_t world,
                             ar_sample_t *out)
 {
 	return ar_system_probe(sys, world, wx, wy, out);
+}
+
+static inline bool ar_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                                 int32_t wx, int32_t wy,
+                                 ar_sample_t *out)
+{
+	return ar_system_probe_view(sys, view_id, world, wx, wy, out);
 }
 
 static inline float ar_elevation_to_float(int16_t q12_4)

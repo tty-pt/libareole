@@ -88,6 +88,18 @@ static void custom_spherical_bounds_cb(void *bounds_ctx, float ox, float oy, flo
 	*inout_z_min -= sag;
 }
 
+static void level_dependent_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                                    int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx;
+	(void)world;
+	(void)wx;
+	(void)wy;
+	memset(out, 0, sizeof(*out));
+	out->val = (int16_t)(level * 100);
+	out->rgba = 0xFF208020u;
+}
+
 int main(void)
 {
 	printf("=== Running Standalone Generic libareole Spatial Hierarchy Suite ===\n");
@@ -840,6 +852,50 @@ int main(void)
 
 		ar_destroy(hd_cs);
 		printf("  [PASS] Non-divisible grid_dim=48 on 160x128 bounds exact seam continuity verified\n");
+	}
+
+	/* Test 18: Simultaneous High-Altitude 3D View & 2D Ortho Minimap View Isolation */
+	{
+		ar_system_t *iso_cs = ar_create(160, 128, level_dependent_sampler, NULL);
+		assert(iso_cs != NULL);
+
+		/* View 0: High-altitude 3D perspective camera (level >= 5) */
+		float modelview[16], proj[16], mvp[16];
+		float eye[3] = { 0.0f, -25000.0f, 35000.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, 0.707f, 0.707f };
+		ar_mat4_lookat(modelview, eye, target, up);
+		ar_mat4_perspective(proj, 45.0f * 3.14159265f / 180.0f, 16.0f / 9.0f, 10.0f, 200000.0f);
+		ar_mat4_multiply(mvp, proj, modelview);
+
+		const ar_node_t *v0_nodes[AR_DEFAULT_MAX_ACTIVE];
+		ar_cull_opts_t opts0 = {
+			.z_min = -2000.0f, .z_max = 2000.0f,
+			.sag_radius = 40000.0f, .focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 150.0f, .target_quad_px = 2.2f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 5, .max_level = 16,
+			.view_id = 0
+		};
+		size_t n0 = ar_system_query_matrix(iso_cs, 1, mvp, &opts0, v0_nodes, AR_DEFAULT_MAX_ACTIVE);
+		assert(n0 > 0);
+		assert(v0_nodes[0]->level >= 5);
+		assert((v0_nodes[0]->active_view_mask & (1u << 0)) != 0);
+
+		/* View 1: 2D Orthographic Minimap (7x7 rooms = 1120x896 units in 224x224 px) */
+		size_t n1 = ar_eval_ortho(iso_cs, 1, 1, 0.0f, 0.0f, 1120.0f, 896.0f, 224.0f, 224.0f);
+		assert(n1 > 0);
+
+		/* Both views must remain active in the pool without clobbering each other's LOD */
+		ar_sample_t s_v0, s_v1;
+		assert(ar_probe_view(iso_cs, 0, 1, 80, 64, &s_v0));
+		assert(ar_probe_view(iso_cs, 1, 1, 80, 64, &s_v1));
+		/* level_dependent_sampler encodes level * 100 in val; v0 is >= 500, v1 is <= 200 */
+		assert(s_v0.val >= 500);
+		assert(s_v1.val <= 200);
+
+		ar_destroy(iso_cs);
+		printf("  [PASS] Simultaneous High-Altitude 3D View (view 0) & 2D Ortho Minimap (view 1) isolation verified\n");
 	}
 
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
