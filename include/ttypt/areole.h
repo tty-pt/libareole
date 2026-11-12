@@ -150,15 +150,6 @@ static inline uint8_t morton_quad_quadrant(uint64_t key)
 
 #endif /* MORTON_QUAD_DEFINED */
 
-/* Default configuration constants */
-#define AR_DEFAULT_GRID_DIM       32  /* 32x32 quads = 2,048 triangles */
-#define AR_DEFAULT_VERT_DIM       (AR_DEFAULT_GRID_DIM + 1) /* 33x33 vertices */
-#define AR_DEFAULT_VERT_COUNT     (AR_DEFAULT_VERT_DIM * AR_DEFAULT_VERT_DIM) /* 1,089 vertices */
-#define AR_DEFAULT_MAX_LEVELS     17  /* Levels 0..16 */
-#define AR_DEFAULT_MAX_ACTIVE     64  /* Default maximum active nodes in visible frustum */
-#define AR_DEFAULT_POOL_CAPACITY  128 /* Default pre-allocated node buffer pool */
-#define AR_DEFAULT_FALLBACK_RGBA  0xFF303030u
-
 /* Generic sample data evaluated at each grid vertex */
 typedef struct {
 	int16_t  val;        /* Generic scalar displacement / field value */
@@ -183,11 +174,15 @@ typedef void (*ar_bounds_fn)(void *bounds_ctx, float ox, float oy, float w, floa
 typedef struct {
 	int32_t        base_w;          /* Level 0 width in world units (required > 0) */
 	int32_t        base_h;          /* Level 0 height in world units (required > 0) */
-	uint16_t       grid_dim;        /* Quads per edge (0 -> AR_DEFAULT_GRID_DIM = 32) */
-	uint16_t       pool_capacity;   /* Pre-allocated node pool size (0 -> AR_DEFAULT_POOL_CAPACITY = 128) */
-	uint16_t       max_active;      /* Max active nodes per query (0 -> AR_DEFAULT_MAX_ACTIVE = 64) */
-	uint8_t        max_levels;      /* Max hierarchy levels (0 -> AR_DEFAULT_MAX_LEVELS = 17) */
-	uint32_t       default_rgba;    /* Fallback RGBA when sample->rgba == 0 (0 -> AR_DEFAULT_FALLBACK_RGBA) */
+	uint16_t       grid_dim;        /* Quads per edge (required > 0) */
+	uint16_t       pool_capacity;   /* Pre-allocated node pool size (required > 0) */
+	uint16_t       max_active;      /* Max active nodes per query (required > 0) */
+	uint8_t        max_levels;      /* Max hierarchy levels (required > 0) */
+	uint32_t       default_rgba;    /* Fallback RGBA when sample->rgba == 0 */
+	float          z_min;           /* Default vertical lower bound when not overridden in ar_cull_opts_t */
+	float          z_max;           /* Default vertical upper bound when not overridden in ar_cull_opts_t */
+	float          target_quad_px;  /* Default screen-space quad subdivision threshold in pixels */
+	float          margin;          /* Default world-space culling margin */
 	ar_sampler_fn  sampler;         /* Required vertex sampler callback */
 	ar_sparsity_fn sparsity;        /* Optional discrete sparsity callback */
 	void          *user_ctx;        /* Opaque context passed to sampler and sparsity */
@@ -225,16 +220,17 @@ typedef struct {
 
 /* Options for matrix frustum culling, vertical envelope, and LOD splitting */
 typedef struct {
-	float        z_min, z_max;      /* Vertical bounds envelope (default -2000.0f .. 2000.0f) */
+	float        z_min, z_max;      /* Vertical bounds envelope */
 	float        sag_radius;        /* Optional spherical sag radius R (0 = flat or use bounds_fn) */
 	float        focal_x, focal_y;  /* Focal center for distance priority and sag computation */
 	float        margin;            /* World-space padding margin added to node bounds */
-	float        target_quad_px;    /* Screen-space quad LOD subdivision threshold (default 2.0f px) */
+	float        target_quad_px;    /* Screen-space quad LOD subdivision threshold in pixels */
 	float        viewport_w;        /* Viewport width in pixels */
 	float        viewport_h;        /* Viewport height in pixels */
 	uint8_t      min_level;         /* Minimum LOD level clamp */
 	uint8_t      max_level;         /* Maximum LOD level clamp */
 	uint8_t      view_id;           /* View slot identifier (0..7) for multi-view active mask */
+	float        split_hysteresis;  /* Optional split/merge hysteresis band (e.g. 0.12f) to prevent movement flicker */
 	ar_bounds_fn bounds_fn;         /* Optional generic vertical envelope callback */
 	void        *bounds_ctx;        /* Opaque context passed to bounds_fn */
 } ar_cull_opts_t;
@@ -269,6 +265,10 @@ typedef ar_system_t areole_t;
 ar_system_t *ar_system_create_ex(const ar_config_t *cfg);
 
 ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
+                              uint16_t grid_dim,
+                              uint16_t pool_capacity,
+                              uint16_t max_active,
+                              uint8_t max_levels,
                               ar_sampler_fn sampler,
                               ar_sparsity_fn sparsity,
                               void *user_ctx);
@@ -350,10 +350,14 @@ static inline const ar_node_t *ar_node_find(ar_system_t *sys, uint16_t world,
 }
 
 static inline ar_system_t *ar_create(int32_t base_w, int32_t base_h,
+                                     uint16_t grid_dim,
+                                     uint16_t pool_capacity,
+                                     uint16_t max_active,
+                                     uint8_t max_levels,
                                      ar_sampler_fn sampler,
                                      void *user_ctx)
 {
-	return ar_system_create(base_w, base_h, sampler, NULL, user_ctx);
+	return ar_system_create(base_w, base_h, grid_dim, pool_capacity, max_active, max_levels, sampler, NULL, user_ctx);
 }
 
 static inline void ar_destroy(ar_system_t *sys)

@@ -32,11 +32,24 @@ static void default_wasm_sampler(void *user_ctx, uint16_t world, uint8_t level,
 	out->flags = (out->attr[3] > 0) ? 1 : 0;
 }
 
-static const ar_node_t *s_active_nodes[AR_DEFAULT_MAX_ACTIVE];
+static const ar_node_t **s_active_nodes = NULL;
+static size_t s_active_cap = 0;
 static size_t s_active_count = 0;
 
-ISO_EXPORT(ar_system_t *, ar_wasm_create, int32_t base_w, int32_t base_h) {
-	return ar_system_create(base_w, base_h, default_wasm_sampler, NULL, NULL);
+ISO_EXPORT(ar_system_t *, ar_wasm_create, int32_t base_w, int32_t base_h,
+           uint32_t grid_dim, uint32_t pool_capacity, uint32_t max_active, uint32_t max_levels) {
+	if (max_active > s_active_cap) {
+		const ar_node_t ** next = (const ar_node_t **)realloc((void *)s_active_nodes, max_active * sizeof(ar_node_t *));
+		if (!next) return NULL;
+		s_active_nodes = next;
+		s_active_cap = max_active;
+	}
+	return ar_system_create(base_w, base_h,
+	                        (uint16_t)grid_dim,
+	                        (uint16_t)pool_capacity,
+	                        (uint16_t)max_active,
+	                        (uint8_t)max_levels,
+	                        default_wasm_sampler, NULL, NULL);
 }
 
 ISO_EXPORT(void, ar_wasm_destroy, ar_system_t *sys) {
@@ -51,7 +64,7 @@ ISO_EXPORT(uint32_t, ar_wasm_update, ar_system_t *sys, uint32_t world,
                           float cam_x, float cam_y, float cam_z,
                           float pitch, float yaw, float fov,
                           float zoom, float vp_w, float vp_h, float eff_dist) {
-	if (!sys) return 0;
+	if (!sys || !s_active_nodes || s_active_cap == 0) return 0;
 	ar_view_t view = {
 		.cam_x = cam_x, .cam_y = cam_y, .cam_z = cam_z,
 		.pitch = pitch, .yaw = yaw, .fov = fov,
@@ -59,7 +72,7 @@ ISO_EXPORT(uint32_t, ar_wasm_update, ar_system_t *sys, uint32_t world,
 		.viewport_w = vp_w, .viewport_h = vp_h,
 		.eff_cam_dist = eff_dist
 	};
-	s_active_count = ar_system_update(sys, (uint16_t)world, &view, s_active_nodes, AR_DEFAULT_MAX_ACTIVE);
+	s_active_count = ar_system_update(sys, (uint16_t)world, &view, s_active_nodes, s_active_cap);
 	return (uint32_t)s_active_count;
 }
 
@@ -68,7 +81,7 @@ ISO_EXPORT(uint32_t, ar_wasm_get_node_count, void) {
 }
 
 ISO_EXPORT(const ar_node_t *, ar_wasm_get_node_ptr, uint32_t index) {
-	if (index >= s_active_count) return NULL;
+	if (index >= s_active_count || !s_active_nodes) return NULL;
 	return s_active_nodes[index];
 }
 
