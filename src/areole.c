@@ -429,6 +429,7 @@ typedef struct {
 	float   proj_w;
 	float   dist_sq;
 	bool    active;
+	bool    split_blocked;
 } ar_candidate_t;
 
 struct ar_system {
@@ -1129,26 +1130,43 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 					cands[cand_count].dist_sq = ar_dist_to_box_sq(fx, fy, (float)rox, (float)roy,
 					                                              (float)root_w, (float)root_h);
 					cands[cand_count].active = true;
+					cands[cand_count].split_blocked = false;
 					cand_count++;
 				}
 			}
 		}
 	}
 
-	/* 5. Priority Refinement Loop (with optional split/merge hysteresis for temporal stability) */
+	/* 5. Priority Refinement Loop (with optional split/merge hysteresis and per-query populate budget) */
 	float target_quad_px = (opts && opts->target_quad_px > 0.0f) ? opts->target_quad_px : sys->target_quad_px;
 	float split_threshold = target_quad_px * (float)sys->grid_dim;
 	float hyst = (opts && opts->split_hysteresis > 0.0f) ? opts->split_hysteresis : 0.0f;
 	if (hyst > 0.45f) hyst = 0.45f;
 	uint8_t view_mask = (opts && opts->view_id < 8) ? (uint8_t)(1u << opts->view_id) : 1u;
 	uint8_t min_lvl = opts ? opts->min_level : 0;
+	uint16_t max_pops = opts ? opts->max_populates_per_query : 0;
+	uint32_t pops_used = 0;
+
+	if (max_pops > 0) {
+		for (size_t k = 0; k < cand_count; k++) {
+			if (!cands[k].active) continue;
+			uint64_t rkey = morton_quad_key(world, cands[k].level, cands[k].ox, cands[k].oy,
+			                                sys->base_w, sys->base_h);
+			uint32_t rslot = 0;
+			bool cached = (islet_quad_map_get(&sys->map, rkey, &rslot) &&
+			               rslot < sys->pool_capacity && sys->pool[rslot].state == 1);
+			if (!cached)
+				pops_used++;
+			(void)ar_get_or_populate(sys, world, cands[k].level, cands[k].ox, cands[k].oy);
+		}
+	}
 
 	while (cand_count + 3 <= max_candidates) {
 		int best_idx = -1;
 		float best_ratio = 1.0f;
 
 		for (size_t k = 0; k < cand_count; k++) {
-			if (!cands[k].active || cands[k].level <= min_lvl)
+			if (!cands[k].active || cands[k].split_blocked || cands[k].level <= min_lvl)
 				continue;
 
 			float node_thresh = split_threshold;
@@ -1193,12 +1211,15 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			float   proj_w;
 			float   dist_sq;
 			bool    visible;
+			bool    cached;
 		} kids[4];
 		size_t vis_kids = 0;
+		uint32_t uncached_vis_kids = 0;
 
 		for (int c = 0; c < 4; c++) {
 			kids[c].ox = pox + ((c & 1) ? cw : 0);
 			kids[c].oy = poy + ((c & 2) ? ch : 0);
+			kids[c].cached = false;
 			float kid_z_min, kid_z_max;
 			ar_compute_bounds_envelope(sys, opts, (float)kids[c].ox, (float)kids[c].oy,
 			                           (float)cw, (float)ch, &kid_z_min, &kid_z_max);
@@ -1211,6 +1232,15 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				                                           (float)cw, (float)ch, z_mid, vp_w, vp_h);
 				kids[c].dist_sq = ar_dist_to_box_sq(fx, fy, (float)kids[c].ox, (float)kids[c].oy,
 				                                     (float)cw, (float)ch);
+				if (max_pops > 0) {
+					uint64_t ckey = morton_quad_key(world, child_lvl, kids[c].ox, kids[c].oy,
+					                                sys->base_w, sys->base_h);
+					uint32_t cslot = 0;
+					kids[c].cached = (islet_quad_map_get(&sys->map, ckey, &cslot) &&
+					                  cslot < sys->pool_capacity && sys->pool[cslot].state == 1);
+					if (!kids[c].cached)
+						uncached_vis_kids++;
+				}
 				vis_kids++;
 			}
 		}
@@ -1220,8 +1250,24 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			continue;
 		}
 
+		if (max_pops > 0 && uncached_vis_kids > 0 && pops_used + uncached_vis_kids > max_pops) {
+			cands[best_idx].split_blocked = true;
+			continue;
+		}
+
 		if (cand_count + vis_kids - 1 > max_candidates)
 			break;
+
+		if (max_pops > 0) {
+			/* Ensure parent is populated first so children reuse 25% of even-grid vertices */
+			(void)ar_get_or_populate(sys, world, cands[best_idx].level, pox, poy);
+			for (int c = 0; c < 4; c++) {
+				if (kids[c].visible) {
+					(void)ar_get_or_populate(sys, world, child_lvl, kids[c].ox, kids[c].oy);
+				}
+			}
+			pops_used += uncached_vis_kids;
+		}
 
 		bool replaced = false;
 		for (int c = 0; c < 4; c++) {
@@ -1233,6 +1279,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				cands[best_idx].proj_w = kids[c].proj_w;
 				cands[best_idx].dist_sq = kids[c].dist_sq;
 				cands[best_idx].active = true;
+				cands[best_idx].split_blocked = false;
 				replaced = true;
 			} else {
 				cands[cand_count].ox = kids[c].ox;
@@ -1241,6 +1288,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				cands[cand_count].proj_w = kids[c].proj_w;
 				cands[cand_count].dist_sq = kids[c].dist_sq;
 				cands[cand_count].active = true;
+				cands[cand_count].split_blocked = false;
 				cand_count++;
 			}
 		}

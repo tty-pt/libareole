@@ -230,6 +230,7 @@ typedef struct {
 	uint8_t      min_level;         /* Minimum LOD level clamp */
 	uint8_t      max_level;         /* Maximum LOD level clamp */
 	uint8_t      view_id;           /* View slot identifier (0..7) for multi-view active mask */
+	uint16_t     max_populates_per_query; /* Optional per-query new-chunk populate cap (0 = unlimited) */
 	float        split_hysteresis;  /* Optional split/merge hysteresis band (e.g. 0.12f) to prevent movement flicker */
 	ar_bounds_fn bounds_fn;         /* Optional generic vertical envelope callback */
 	void        *bounds_ctx;        /* Opaque context passed to bounds_fn */

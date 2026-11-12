@@ -951,6 +951,54 @@ int main(void)
 		printf("  [PASS] Hierarchical parent/child sample cache reuse verified (saved %d sampler calls/node)\n", 17 * 17);
 	}
 
+	/* Test 20: Progressive Per-Query Population Budget (max_populates_per_query) */
+	{
+		ar_system_t *prog_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                 mock_sampler, NULL);
+		assert(prog_cs != NULL);
+
+		float eye[3] = { 0.0f, 900.0f, 1200.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, -1.0f, 0.0f };
+		float mv[16], proj[16], mvp[16];
+		ar_mat4_lookat(mv, eye, target, up);
+		ar_mat4_perspective(proj, 0.785398f, 16.0f / 9.0f, 2.0f, 200000.0f);
+		ar_mat4_multiply(mvp, proj, mv);
+
+		ar_cull_opts_t opts_budget = {
+			.z_min = -500.0f, .z_max = 500.0f,
+			.focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 100.0f, .target_quad_px = 2.0f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 0, .max_level = 10,
+			.view_id = 0,
+			.max_populates_per_query = 8
+		};
+
+		const ar_node_t *nodes[TEST_MAX_ACTIVE];
+		size_t n_f1 = ar_system_query_matrix(prog_cs, 1, mvp, &opts_budget, nodes, TEST_MAX_ACTIVE);
+		assert(n_f1 > 0);
+		ar_stats_t st_f1;
+		ar_system_get_stats(prog_cs, &st_f1);
+		assert(st_f1.cache_misses_total <= 16);
+
+		/* Subsequent frames progressively refine to full resolution until cache_misses stop growing */
+		size_t prev_misses = st_f1.cache_misses_total;
+		size_t n_final = n_f1;
+		for (int f = 0; f < 16; f++) {
+			ar_system_begin_frame(prog_cs);
+			n_final = ar_system_query_matrix(prog_cs, 1, mvp, &opts_budget, nodes, TEST_MAX_ACTIVE);
+			ar_stats_t st_cur;
+			ar_system_get_stats(prog_cs, &st_cur);
+			assert(st_cur.cache_misses_total - prev_misses <= 8);
+			prev_misses = st_cur.cache_misses_total;
+		}
+		assert(n_final >= n_f1);
+
+		ar_destroy(prog_cs);
+		printf("  [PASS] Progressive per-query population budget (max_populates_per_query=8) verified\n");
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;
