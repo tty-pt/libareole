@@ -7,8 +7,10 @@ CFLAGS ?= -Wall -Wextra -Werror -O2 -Iinclude -I../libislet/include
 LDLIBS ?= -lm
 
 WASM_CC ?= clang
-WASM_CFLAGS ?= --target=wasm32-wasi -ffreestanding -flto -O3 -D__wasm__ -fvisibility=hidden -I./include -I../libislet/include -I../mk/include -I/usr/include
-WASM_LDFLAGS ?= -mexec-model=reactor -Wl,--gc-sections -Wl,--no-entry -Wl,--allow-undefined -Wl,--export=malloc -Wl,--export=free \
+WASM_CFLAGS ?= --target=wasm32-wasi -ffreestanding -flto -O3 -D__wasm__ -fvisibility=hidden -I./include -I../libislet/include -I../libstele/include -I../mk/include -I/usr/include
+WASM_LDFLAGS ?= -mexec-model=reactor -Wl,--gc-sections -Wl,--no-entry -Wl,--allow-undefined \
+	-Wl,--import-memory -Wl,-z,stack-size=32768 -Wl,--global-base=1769472 \
+	-Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc \
 	-Wl,--export=ar_wasm_create \
 	-Wl,--export=ar_wasm_destroy \
 	-Wl,--export=ar_wasm_clear \
@@ -39,9 +41,11 @@ bin/test_glsl: tests/test_glsl.c include/ttypt/areole_glsl.h
 
 wasm: npm/dist/areole.wasm
 
-npm/dist/areole.wasm: npm/wasm/areole_wasm.c src/areole.c include/ttypt/areole.h
+npm/dist/areole.wasm: npm/wasm/areole_wasm.c src/areole.c include/ttypt/areole.h ../mk/wasm_alloc_shim.c
 	@mkdir -p npm/dist
-	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) npm/wasm/areole_wasm.c src/areole.c -o $@
+	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) npm/wasm/areole_wasm.c src/areole.c ../mk/wasm_alloc_shim.c -o $@
+	@ln -sf areole.wasm npm/dist/chunk.wasm
+	@if [ -d ../libchunk/npm/dist ]; then cp -f $@ ../libchunk/npm/dist/chunk.wasm; fi
 
 npm-build: wasm
 	@if command -v $(NPM) >/dev/null 2>&1; then \
