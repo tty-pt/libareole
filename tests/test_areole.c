@@ -999,6 +999,16 @@ int main(void)
 		printf("  [PASS] Progressive per-query population budget (max_populates_per_query=8) verified\n");
 	}
 
+	/* 21. Multi-scale LOD texel span helper (ar_level_texel_span) */
+	{
+		float span0 = ar_level_texel_span(16384, 32, 0);
+		float span2 = ar_level_texel_span(16384, 32, 2);
+		assert(fabsf(span0 - 512.0f) < 1e-4f);
+		assert(fabsf(span2 - 128.0f) < 1e-4f);
+		assert(ar_level_texel_span(16384, 0, 0) == 0.0f);
+		printf("  [PASS] ar_level_texel_span verified (L0=%.1f, L2=%.1f)\n", span0, span2);
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;

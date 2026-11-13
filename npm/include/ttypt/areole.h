@@ -230,6 +230,7 @@ typedef struct {
 	uint8_t      min_level;         /* Minimum LOD level clamp */
 	uint8_t      max_level;         /* Maximum LOD level clamp */
 	uint8_t      view_id;           /* View slot identifier (0..7) for multi-view active mask */
+	uint16_t     max_populates_per_query; /* Optional per-query new-chunk populate cap (0 = unlimited) */
 	float        split_hysteresis;  /* Optional split/merge hysteresis band (e.g. 0.12f) to prevent movement flicker */
 	ar_bounds_fn bounds_fn;         /* Optional generic vertical envelope callback */
 	void        *bounds_ctx;        /* Opaque context passed to bounds_fn */
@@ -422,6 +423,18 @@ static inline float ar_elevation_to_float(int16_t q12_4)
 static inline int16_t ar_elevation_from_float(float val)
 {
 	return (int16_t)(val * 16.0f);
+}
+
+/**
+ * Compute the world-space sampling step (texel span) for a quadtree LOD level.
+ * Used to pass into chaff_band_range_for_step_q16 for Nyquist frequency culling.
+ */
+static inline float ar_level_texel_span(int32_t base_span, uint16_t grid_dim, uint8_t level)
+{
+	if (grid_dim == 0 || level >= 31)
+		return 0.0f;
+	float chunk_span = (float)(base_span >> level);
+	return chunk_span / (float)grid_dim;
 }
 
 /* Statistics inspection for diagnostics and unit tests */

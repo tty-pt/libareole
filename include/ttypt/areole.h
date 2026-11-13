@@ -425,6 +425,18 @@ static inline int16_t ar_elevation_from_float(float val)
 	return (int16_t)(val * 16.0f);
 }
 
+/**
+ * Compute the world-space sampling step (texel span) for a quadtree LOD level.
+ * Used to pass into chaff_band_range_for_step_q16 for Nyquist frequency culling.
+ */
+static inline float ar_level_texel_span(int32_t base_span, uint16_t grid_dim, uint8_t level)
+{
+	if (grid_dim == 0 || level >= 31)
+		return 0.0f;
+	float chunk_span = (float)(base_span >> level);
+	return chunk_span / (float)grid_dim;
+}
+
 /* Statistics inspection for diagnostics and unit tests */
 typedef struct {
 	size_t  pool_capacity;
