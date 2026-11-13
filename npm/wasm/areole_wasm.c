@@ -38,6 +38,10 @@ static size_t s_active_count = 0;
 
 ISO_EXPORT(ar_system_t *, ar_wasm_create, int32_t base_w, int32_t base_h,
            uint32_t grid_dim, uint32_t pool_capacity, uint32_t max_active, uint32_t max_levels) {
+	if (!grid_dim) grid_dim = 32;
+	if (!pool_capacity) pool_capacity = 128;
+	if (!max_active) max_active = 64;
+	if (!max_levels) max_levels = 8;
 	if (max_active > s_active_cap) {
 		const ar_node_t ** next = (const ar_node_t **)realloc((void *)s_active_nodes, max_active * sizeof(ar_node_t *));
 		if (!next) return NULL;

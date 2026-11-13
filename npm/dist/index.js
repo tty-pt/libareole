@@ -9,10 +9,10 @@ export function getAreoleWasm() {
 }
 
 
-export function createAreoleSystem(baseW = 160, baseH = 128) {
+export function createAreoleSystem(baseW = 160, baseH = 128, gridDim = 32, poolCap = 128, maxActive = 64, maxLevels = 8) {
   const wasm = getAreoleWasm();
   const substrate = getSubstrate();
-  const handle = wasm.exports.ar_wasm_create(baseW, baseH);
+  const handle = wasm.exports.ar_wasm_create(baseW, baseH, gridDim, poolCap, maxActive, maxLevels);
   if (!handle) {
     throw new Error("Failed to create ar_system in WASM linear memory");
   }
