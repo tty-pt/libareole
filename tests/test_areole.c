@@ -88,11 +88,29 @@ static void custom_spherical_bounds_cb(void *bounds_ctx, float ox, float oy, flo
 	*inout_z_min -= sag;
 }
 
+static void level_dependent_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                                    int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx;
+	(void)world;
+	(void)wx;
+	(void)wy;
+	memset(out, 0, sizeof(*out));
+	out->val = (int16_t)(level * 100);
+	out->rgba = 0xFF208020u;
+}
+
+#define TEST_GRID_DIM      32
+#define TEST_POOL_CAP      128
+#define TEST_MAX_ACTIVE    64
+#define TEST_MAX_LEVELS    17
+
 int main(void)
 {
 	printf("=== Running Standalone Generic libareole Spatial Hierarchy Suite ===\n");
 
-	ar_system_t *cs = ar_system_create(160, 128, mock_sampler, mock_sparsity, NULL);
+	ar_system_t *cs = ar_system_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+	                                   mock_sampler, mock_sparsity, NULL);
 	assert(cs != NULL);
 	printf("  [PASS] ar_system_create initialized successfully\n");
 
@@ -185,17 +203,17 @@ int main(void)
 			.eff_cam_dist = 400.0f
 		};
 
-		const ar_node_t *out_chunks[AR_DEFAULT_MAX_ACTIVE];
-		size_t n = ar_system_update(cs, 1, &view, out_chunks, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *out_chunks[TEST_MAX_ACTIVE];
+		size_t n = ar_system_update(cs, 1, &view, out_chunks, TEST_MAX_ACTIVE);
 
 		assert(n > 0);
-		assert(n <= AR_DEFAULT_MAX_ACTIVE);
+		assert(n <= TEST_MAX_ACTIVE);
 
 		ar_stats_t stats;
 		ar_system_get_stats(cs, &stats);
 
 		printf("  [PASS] Zoom %9.4fx -> Active Nodes: %2zu (Max Bound: %d) | Levels [%u..%u]\n",
-		       zoom, n, AR_DEFAULT_MAX_ACTIVE, stats.min_level_observed, stats.max_level_observed);
+		       zoom, n, TEST_MAX_ACTIVE, stats.min_level_observed, stats.max_level_observed);
 	}
 
 	/* Test 2: Distance-Adaptive Multi-Scale Level Selection */
@@ -207,8 +225,8 @@ int main(void)
 			.viewport_w = 1280.0f, .viewport_h = 720.0f,
 			.eff_cam_dist = 400.0f
 		};
-		const ar_node_t *close_chunks[AR_DEFAULT_MAX_ACTIVE];
-		size_t nc = ar_system_update(cs, 1, &view_close, close_chunks, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *close_chunks[TEST_MAX_ACTIVE];
+		size_t nc = ar_system_update(cs, 1, &view_close, close_chunks, TEST_MAX_ACTIVE);
 		assert(nc > 0);
 
 		uint8_t min_lvl_close = 255;
@@ -225,8 +243,8 @@ int main(void)
 			.viewport_w = 1280.0f, .viewport_h = 720.0f,
 			.eff_cam_dist = 400.0f
 		};
-		const ar_node_t *far_chunks[AR_DEFAULT_MAX_ACTIVE];
-		size_t nf = ar_system_update(cs, 1, &view_far, far_chunks, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *far_chunks[TEST_MAX_ACTIVE];
+		size_t nf = ar_system_update(cs, 1, &view_far, far_chunks, TEST_MAX_ACTIVE);
 		assert(nf > 0);
 
 		uint8_t max_lvl_far = 0;
@@ -275,8 +293,8 @@ int main(void)
 				.viewport_h = 720.0f,
 				.eff_cam_dist = 400.0f
 			};
-			const ar_node_t *pan_chunks[AR_DEFAULT_MAX_ACTIVE];
-			ar_system_update(cs, 1, &view_pan, pan_chunks, AR_DEFAULT_MAX_ACTIVE);
+			const ar_node_t *pan_chunks[TEST_MAX_ACTIVE];
+			ar_system_update(cs, 1, &view_pan, pan_chunks, TEST_MAX_ACTIVE);
 		}
 
 		ar_system_get_stats(cs, &s_after);
@@ -294,8 +312,8 @@ int main(void)
 			.viewport_w = 1280.0f, .viewport_h = 720.0f,
 			.eff_cam_dist = 400.0f
 		};
-		const ar_node_t *center_chunks[AR_DEFAULT_MAX_ACTIVE];
-		size_t nc = ar_system_update(cs, 1, &view_center, center_chunks, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *center_chunks[TEST_MAX_ACTIVE];
+		size_t nc = ar_system_update(cs, 1, &view_center, center_chunks, TEST_MAX_ACTIVE);
 
 		bool found_structure = false;
 		for (size_t i = 0; i < nc; i++) {
@@ -321,8 +339,8 @@ int main(void)
 
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
 			bench_view.cam_x += 0.5f;
-			const ar_node_t *bench_chunks[AR_DEFAULT_MAX_ACTIVE];
-			ar_system_update(cs, 1, &bench_view, bench_chunks, AR_DEFAULT_MAX_ACTIVE);
+			const ar_node_t *bench_chunks[TEST_MAX_ACTIVE];
+			ar_system_update(cs, 1, &bench_view, bench_chunks, TEST_MAX_ACTIVE);
 		}
 
 		clock_t end = clock();
@@ -337,7 +355,8 @@ int main(void)
 
 	/* Test 7: Ergonomic Shorthand & Legacy chunk_* Alias Compatibility */
 	{
-		ar_system_t *simple_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *simple_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                   mock_sampler, NULL);
 		assert(simple_cs != NULL);
 
 		ar_view_t view = {
@@ -348,9 +367,9 @@ int main(void)
 			.eff_cam_dist = 400.0f
 		};
 
-		const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t active_count = ar_update(simple_cs, 1, &view, out_nodes, AR_DEFAULT_MAX_ACTIVE);
-		assert(active_count > 0 && active_count <= AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
+		size_t active_count = ar_update(simple_cs, 1, &view, out_nodes, TEST_MAX_ACTIVE);
+		assert(active_count > 0 && active_count <= TEST_MAX_ACTIVE);
 
 		ar_sample_t probe_sample;
 		bool probe_ok = ar_probe(simple_cs, 1, 0, 0, &probe_sample);
@@ -366,7 +385,8 @@ int main(void)
 
 	/* Test 8: O(1) Morton Key Spatial Lookup & Multi-Level Coexistence */
 	{
-		ar_system_t *morton_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *morton_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                   mock_sampler, NULL);
 		assert(morton_cs != NULL);
 
 		ar_view_t view_center = {
@@ -376,8 +396,8 @@ int main(void)
 			.viewport_w = 1280.0f, .viewport_h = 720.0f,
 			.eff_cam_dist = 400.0f
 		};
-		const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t n = ar_update(morton_cs, 1, &view_center, out_nodes, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
+		size_t n = ar_update(morton_cs, 1, &view_center, out_nodes, TEST_MAX_ACTIVE);
 		assert(n > 0);
 
 		for (size_t i = 0; i < n; i++) {
@@ -395,8 +415,8 @@ int main(void)
 
 		ar_view_t view_wide = view_center;
 		view_wide.zoom = 0.05f;
-		const ar_node_t *wide_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t nw = ar_update(morton_cs, 1, &view_wide, wide_nodes, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *wide_nodes[TEST_MAX_ACTIVE];
+		size_t nw = ar_update(morton_cs, 1, &view_wide, wide_nodes, TEST_MAX_ACTIVE);
 		assert(nw > 0);
 
 		bool found_high_level = false;
@@ -412,7 +432,8 @@ int main(void)
 
 	/* Test 9: 2D Orthographic View Traversal */
 	{
-		ar_system_t *ortho_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *ortho_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                  mock_sampler, NULL);
 		assert(ortho_cs != NULL);
 
 		ar_view_t ortho_view = {
@@ -422,17 +443,17 @@ int main(void)
 			.viewport_w = 224.0f, .viewport_h = 224.0f,
 			.eff_cam_dist = 0.0f
 		};
-		const ar_node_t *ortho_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t count = ar_update(ortho_cs, 1, &ortho_view, ortho_nodes, AR_DEFAULT_MAX_ACTIVE);
-		assert(count > 0 && count <= AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *ortho_nodes[TEST_MAX_ACTIVE];
+		size_t count = ar_update(ortho_cs, 1, &ortho_view, ortho_nodes, TEST_MAX_ACTIVE);
+		assert(count > 0 && count <= TEST_MAX_ACTIVE);
 
 		for (size_t i = 0; i < count; i++) {
 			assert(ortho_nodes[i]->level <= 1);
 		}
 
 		ortho_view.zoom = 0.10f;
-		count = ar_update(ortho_cs, 1, &ortho_view, ortho_nodes, AR_DEFAULT_MAX_ACTIVE);
-		assert(count > 0 && count <= AR_DEFAULT_MAX_ACTIVE);
+		count = ar_update(ortho_cs, 1, &ortho_view, ortho_nodes, TEST_MAX_ACTIVE);
+		assert(count > 0 && count <= TEST_MAX_ACTIVE);
 
 		bool has_coarser = false;
 		for (size_t i = 0; i < count; i++) {
@@ -446,7 +467,8 @@ int main(void)
 
 	/* Test 10: Strict Leaf Partitioning & Zero Overlap */
 	{
-		ar_system_t *part_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *part_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                 mock_sampler, NULL);
 		assert(part_cs != NULL);
 
 		const float test_zooms[] = { 2.0f, 1.0f, 0.5f, 0.25f, 0.10f, 0.05f };
@@ -458,8 +480,8 @@ int main(void)
 				.viewport_w = 1280.0f, .viewport_h = 720.0f,
 				.eff_cam_dist = 400.0f
 			};
-			const ar_node_t *nodes[AR_DEFAULT_MAX_ACTIVE];
-			size_t n = ar_update(part_cs, 1, &view, nodes, AR_DEFAULT_MAX_ACTIVE);
+			const ar_node_t *nodes[TEST_MAX_ACTIVE];
+			size_t n = ar_update(part_cs, 1, &view, nodes, TEST_MAX_ACTIVE);
 			assert(n > 0);
 
 			for (size_t a = 0; a < n; a++) {
@@ -487,7 +509,8 @@ int main(void)
 
 	/* Test 11: Multi-View System Evaluation & libislet Spatial Database Integration */
 	{
-		ar_system_t *mv_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *mv_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                               mock_sampler, NULL);
 		assert(mv_cs != NULL);
 
 		ar_begin_frame(mv_cs);
@@ -501,8 +524,8 @@ int main(void)
 			.min_level = 0,
 			.max_level = 11
 		};
-		ar_draw_item_t items_seven[AR_DEFAULT_MAX_ACTIVE];
-		size_t count_seven = ar_eval_view(mv_cs, 0, 1, &view_seven, items_seven, AR_DEFAULT_MAX_ACTIVE);
+		ar_draw_item_t items_seven[TEST_MAX_ACTIVE];
+		size_t count_seven = ar_eval_view(mv_cs, 0, 1, &view_seven, items_seven, TEST_MAX_ACTIVE);
 		assert(count_seven > 0);
 
 		for (size_t i = 0; i < count_seven; i++) {
@@ -519,8 +542,8 @@ int main(void)
 			.min_level = 2,
 			.max_level = 3
 		};
-		ar_draw_item_t items_lamina[AR_DEFAULT_MAX_ACTIVE];
-		size_t count_lamina = ar_eval_view(mv_cs, 1, 1, &view_lamina, items_lamina, AR_DEFAULT_MAX_ACTIVE);
+		ar_draw_item_t items_lamina[TEST_MAX_ACTIVE];
+		size_t count_lamina = ar_eval_view(mv_cs, 1, 1, &view_lamina, items_lamina, TEST_MAX_ACTIVE);
 		assert(count_lamina > 0);
 
 		for (size_t i = 0; i < count_lamina; i++) {
@@ -544,7 +567,8 @@ int main(void)
 
 	/* Test 12: Varied Multi-View System with Analytical Multi-Octave Sampler */
 	{
-		ar_system_t *multi_cs = ar_create(160, 128, analytical_multioctave_sampler, NULL);
+		ar_system_t *multi_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                  analytical_multioctave_sampler, NULL);
 		assert(multi_cs != NULL);
 
 		ar_begin_frame(multi_cs);
@@ -574,15 +598,15 @@ int main(void)
 			.eff_cam_dist = 0.0f, .min_level = 4, .max_level = 11
 		};
 
-		ar_draw_item_t items_inspect[AR_DEFAULT_MAX_ACTIVE];
-		ar_draw_item_t items_diorama[AR_DEFAULT_MAX_ACTIVE];
-		ar_draw_item_t items_tactical[AR_DEFAULT_MAX_ACTIVE];
-		ar_draw_item_t items_minimap[AR_DEFAULT_MAX_ACTIVE];
+		ar_draw_item_t items_inspect[TEST_MAX_ACTIVE];
+		ar_draw_item_t items_diorama[TEST_MAX_ACTIVE];
+		ar_draw_item_t items_tactical[TEST_MAX_ACTIVE];
+		ar_draw_item_t items_minimap[TEST_MAX_ACTIVE];
 
-		size_t n_inspect  = ar_eval_view(multi_cs, 0, 1, &view_inspect,  items_inspect,  AR_DEFAULT_MAX_ACTIVE);
-		size_t n_diorama  = ar_eval_view(multi_cs, 1, 1, &view_diorama,  items_diorama,  AR_DEFAULT_MAX_ACTIVE);
-		size_t n_tactical = ar_eval_view(multi_cs, 2, 1, &view_tactical, items_tactical, AR_DEFAULT_MAX_ACTIVE);
-		size_t n_minimap  = ar_eval_view(multi_cs, 3, 1, &view_minimap,  items_minimap,  AR_DEFAULT_MAX_ACTIVE);
+		size_t n_inspect  = ar_eval_view(multi_cs, 0, 1, &view_inspect,  items_inspect,  TEST_MAX_ACTIVE);
+		size_t n_diorama  = ar_eval_view(multi_cs, 1, 1, &view_diorama,  items_diorama,  TEST_MAX_ACTIVE);
+		size_t n_tactical = ar_eval_view(multi_cs, 2, 1, &view_tactical, items_tactical, TEST_MAX_ACTIVE);
+		size_t n_minimap  = ar_eval_view(multi_cs, 3, 1, &view_minimap,  items_minimap,  TEST_MAX_ACTIVE);
 
 		assert(n_inspect > 0);
 		assert(n_diorama > 0);
@@ -600,7 +624,8 @@ int main(void)
 
 	/* Test 13: Frustum Extraction & AABB Culling across Projections */
 	{
-		ar_system_t *mat_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *mat_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                mock_sampler, NULL);
 		assert(mat_cs != NULL);
 
 		/* A. Orthographic Projection */
@@ -619,14 +644,14 @@ int main(void)
 			assert(ar_frustum_test_box(&f, -80.0f, -64.0f, -100.0f, 80.0f, 64.0f, 100.0f));
 			assert(!ar_frustum_test_box(&f, 5000.0f, 5000.0f, 0.0f, 5160.0f, 5128.0f, 100.0f));
 
-			const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
+			const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
 			ar_cull_opts_t opts = {
 				.z_min = -1000.0f, .z_max = 1000.0f,
 				.sag_radius = 0.0f, .focal_x = 0.0f, .focal_y = 0.0f,
 				.margin = 50.0f, .target_quad_px = 2.0f,
 				.viewport_w = 800.0f, .viewport_h = 600.0f
 			};
-			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, AR_DEFAULT_MAX_ACTIVE);
+			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, TEST_MAX_ACTIVE);
 			assert(n > 0);
 			printf("  [PASS] Orthographic projection frustum extraction & query verified (%zu nodes)\n", n);
 		}
@@ -647,14 +672,14 @@ int main(void)
 			assert(ar_frustum_test_box(&f, -80.0f, -64.0f, -50.0f, 80.0f, 64.0f, 50.0f));
 			assert(!ar_frustum_test_box(&f, -80.0f, -1628.0f, 0.0f, 80.0f, -1500.0f, 50.0f));
 
-			const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
+			const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
 			ar_cull_opts_t opts = {
 				.z_min = -500.0f, .z_max = 500.0f,
 				.sag_radius = 0.0f, .focal_x = 0.0f, .focal_y = 0.0f,
 				.margin = 50.0f, .target_quad_px = 2.0f,
 				.viewport_w = 1280.0f, .viewport_h = 720.0f
 			};
-			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, AR_DEFAULT_MAX_ACTIVE);
+			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, TEST_MAX_ACTIVE);
 			assert(n > 0);
 			printf("  [PASS] Perspective projection frustum extraction & query verified (%zu nodes)\n", n);
 		}
@@ -672,14 +697,14 @@ int main(void)
 			ar_frustum_from_matrix(&f, mvp);
 			assert(ar_frustum_test_box(&f, -100.0f, -100.0f, -50.0f, 100.0f, 100.0f, 50.0f));
 
-			const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
+			const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
 			ar_cull_opts_t opts = {
 				.z_min = -200.0f, .z_max = 200.0f,
 				.sag_radius = 0.0f, .focal_x = 0.0f, .focal_y = 0.0f,
 				.margin = 50.0f, .target_quad_px = 2.0f,
 				.viewport_w = 1000.0f, .viewport_h = 1000.0f
 			};
-			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, AR_DEFAULT_MAX_ACTIVE);
+			size_t n = ar_system_query_matrix(mat_cs, 1, mvp, &opts, out_nodes, TEST_MAX_ACTIVE);
 			assert(n > 0);
 			printf("  [PASS] Oblique sheared projection query verified (%zu nodes)\n", n);
 		}
@@ -689,7 +714,8 @@ int main(void)
 
 	/* Test 14: 360-Degree Yaw Rotation & Pitch Angles (0 deg to 85 deg) */
 	{
-		ar_system_t *rot_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *rot_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                mock_sampler, NULL);
 		assert(rot_cs != NULL);
 
 		const float pitches[] = { 0.0f, 0.2618f, 0.5236f, 0.9599f, 1.309f, 1.4835f };
@@ -714,15 +740,15 @@ int main(void)
 				ar_mat4_perspective(proj, 45.0f * 3.14159265f / 180.0f, 16.0f / 9.0f, 10.0f, 5000.0f);
 				ar_mat4_multiply(mvp, proj, modelview);
 
-				const ar_node_t *out_nodes[AR_DEFAULT_MAX_ACTIVE];
+				const ar_node_t *out_nodes[TEST_MAX_ACTIVE];
 				ar_cull_opts_t opts = {
 					.z_min = -200.0f, .z_max = 200.0f,
 					.sag_radius = 0.0f, .focal_x = 0.0f, .focal_y = 0.0f,
 					.margin = 50.0f, .target_quad_px = 2.0f,
 					.viewport_w = 1280.0f, .viewport_h = 720.0f
 				};
-				size_t n = ar_system_query_matrix(rot_cs, 1, mvp, &opts, out_nodes, AR_DEFAULT_MAX_ACTIVE);
-				assert(n > 0 && n <= AR_DEFAULT_MAX_ACTIVE);
+				size_t n = ar_system_query_matrix(rot_cs, 1, mvp, &opts, out_nodes, TEST_MAX_ACTIVE);
+				assert(n > 0 && n <= TEST_MAX_ACTIVE);
 			}
 		}
 
@@ -732,7 +758,8 @@ int main(void)
 
 	/* Test 15: Custom Vertical Bounds Envelope Callback & Sag Retention */
 	{
-		ar_system_t *sag_cs = ar_create(160, 128, mock_sampler, NULL);
+		ar_system_t *sag_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                mock_sampler, NULL);
 		assert(sag_cs != NULL);
 
 		float R_planet = 18000.0f;
@@ -751,8 +778,8 @@ int main(void)
 			.margin = 0.0f, .target_quad_px = 2.0f,
 			.viewport_w = 1280.0f, .viewport_h = 720.0f
 		};
-		const ar_node_t *flat_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t n_flat = ar_system_query_matrix(sag_cs, 1, mvp, &opts_flat, flat_nodes, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *flat_nodes[TEST_MAX_ACTIVE];
+		size_t n_flat = ar_system_query_matrix(sag_cs, 1, mvp, &opts_flat, flat_nodes, TEST_MAX_ACTIVE);
 
 		ar_cull_opts_t opts_cb = {
 			.z_min = -200.0f, .z_max = 200.0f,
@@ -762,8 +789,8 @@ int main(void)
 			.bounds_fn = custom_spherical_bounds_cb,
 			.bounds_ctx = &R_planet
 		};
-		const ar_node_t *sag_nodes[AR_DEFAULT_MAX_ACTIVE];
-		size_t n_sag = ar_system_query_matrix(sag_cs, 1, mvp, &opts_cb, sag_nodes, AR_DEFAULT_MAX_ACTIVE);
+		const ar_node_t *sag_nodes[TEST_MAX_ACTIVE];
+		size_t n_sag = ar_system_query_matrix(sag_cs, 1, mvp, &opts_cb, sag_nodes, TEST_MAX_ACTIVE);
 
 		assert(n_sag >= n_flat || (n_sag >= 60 && n_flat >= 60));
 		assert(n_sag > 0);
@@ -783,7 +810,8 @@ int main(void)
 
 	/* Test 16: Generic Sample Data Integrity */
 	{
-		ar_system_t *gen_cs = ar_create(160, 128, analytical_multioctave_sampler, NULL);
+		ar_system_t *gen_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                analytical_multioctave_sampler, NULL);
 		assert(gen_cs != NULL);
 
 		const ar_node_t *node = ar_system_ensure(gen_cs, 1, 0, 0, 0);
@@ -803,6 +831,185 @@ int main(void)
 		printf("  [PASS] Generic sample data integrity (val, rgba, attr[0..7], flags) verified\n");
 	}
 
+	/* Test 17: Non-divisible grid_dim (48 on 160x128) exact boundary seam continuity */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.max_levels = 4;
+		cfg.grid_dim = 48;
+		cfg.pool_capacity = 64;
+		cfg.max_active = 32;
+		cfg.sampler = mock_sampler;
+
+		ar_system_t *hd_cs = ar_system_create_ex(&cfg);
+		assert(hd_cs != NULL);
+
+		const ar_node_t *n00 = ar_system_ensure(hd_cs, 1, 0, 0, 0);
+		const ar_node_t *n10 = ar_system_ensure(hd_cs, 1, 0, 160, 0);
+		const ar_node_t *n01 = ar_system_ensure(hd_cs, 1, 0, 0, 128);
+		assert(n00 != NULL && n10 != NULL && n01 != NULL);
+		assert(n00->grid_dim == 48 && n00->vert_dim == 49 && n00->vert_count == 2401);
+
+		/* Right edge of (0,0) at c=48 must match left edge of (160,0) at c=0 */
+		for (uint32_t r = 0; r < n00->vert_dim; r++) {
+			int16_t left_chunk_right_edge = n00->values[r * n00->vert_dim + 48];
+			int16_t right_chunk_left_edge = n10->values[r * n10->vert_dim + 0];
+			assert(left_chunk_right_edge == right_chunk_left_edge);
+		}
+
+		/* Bottom edge of (0,0) at r=48 must match top edge of (0,128) at r=0 */
+		for (uint32_t c = 0; c < n00->vert_dim; c++) {
+			int16_t top_chunk_bottom_edge = n00->values[48 * n00->vert_dim + c];
+			int16_t bottom_chunk_top_edge = n01->values[0 * n01->vert_dim + c];
+			assert(top_chunk_bottom_edge == bottom_chunk_top_edge);
+		}
+
+		ar_destroy(hd_cs);
+		printf("  [PASS] Non-divisible grid_dim=48 on 160x128 bounds exact seam continuity verified\n");
+	}
+
+	/* Test 18: Simultaneous High-Altitude 3D View & 2D Ortho Minimap View Isolation */
+	{
+		ar_system_t *iso_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                level_dependent_sampler, NULL);
+		assert(iso_cs != NULL);
+
+		/* View 0: High-altitude 3D perspective camera (level >= 5) */
+		float modelview[16], proj[16], mvp[16];
+		float eye[3] = { 0.0f, -25000.0f, 35000.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, 0.707f, 0.707f };
+		ar_mat4_lookat(modelview, eye, target, up);
+		ar_mat4_perspective(proj, 45.0f * 3.14159265f / 180.0f, 16.0f / 9.0f, 10.0f, 200000.0f);
+		ar_mat4_multiply(mvp, proj, modelview);
+
+		const ar_node_t *v0_nodes[TEST_MAX_ACTIVE];
+		ar_cull_opts_t opts0 = {
+			.z_min = -2000.0f, .z_max = 2000.0f,
+			.sag_radius = 40000.0f, .focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 150.0f, .target_quad_px = 2.2f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 5, .max_level = 16,
+			.view_id = 0
+		};
+		size_t n0 = ar_system_query_matrix(iso_cs, 1, mvp, &opts0, v0_nodes, TEST_MAX_ACTIVE);
+		assert(n0 > 0);
+		assert(v0_nodes[0]->level >= 5);
+		assert((v0_nodes[0]->active_view_mask & (1u << 0)) != 0);
+
+		/* View 1: 2D Orthographic Minimap (7x7 rooms = 1120x896 units in 224x224 px) */
+		size_t n1 = ar_eval_ortho(iso_cs, 1, 1, 0.0f, 0.0f, 1120.0f, 896.0f, 224.0f, 224.0f);
+		assert(n1 > 0);
+
+		/* Both views must remain active in the pool without clobbering each other's LOD */
+		ar_sample_t s_v0, s_v1;
+		assert(ar_probe_view(iso_cs, 0, 1, 80, 64, &s_v0));
+		assert(ar_probe_view(iso_cs, 1, 1, 80, 64, &s_v1));
+		/* level_dependent_sampler encodes level * 100 in val; v0 is >= 500, v1 is <= 200 */
+		assert(s_v0.val >= 500);
+		assert(s_v1.val <= 200);
+
+		ar_destroy(iso_cs);
+		printf("  [PASS] Simultaneous High-Altitude 3D View (view 0) & 2D Ortho Minimap (view 1) isolation verified\n");
+	}
+
+	/* Test 19: Hierarchical Parent/Child Sample Reuse & Split Hysteresis Stability */
+	{
+		ar_system_t *reuse_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                  mock_sampler, NULL);
+		assert(reuse_cs != NULL);
+
+		/* Populate parent at level 1 covering [0..320] x [0..256] */
+		const ar_node_t *parent = ar_system_ensure(reuse_cs, 1, 1, 0, 0);
+		assert(parent != NULL);
+
+		ar_stats_t st1;
+		ar_system_get_stats(reuse_cs, &st1);
+		size_t full_vert_calls = st1.sampler_invocations_total;
+		assert(full_vert_calls == 33 * 33);
+
+		/* Populate child at level 0 covering [0..160] x [0..128]:
+		 * 17x17 = 289 even grid points MUST be reused from parent without calling sampler! */
+		const ar_node_t *child = ar_system_ensure(reuse_cs, 1, 0, 0, 0);
+		assert(child != NULL);
+
+		ar_stats_t st2;
+		ar_system_get_stats(reuse_cs, &st2);
+		size_t child_calls = st2.sampler_invocations_total - full_vert_calls;
+		assert(child_calls == (33 * 33) - (17 * 17));
+
+		/* Verify exact value identity at all shared even vertices */
+		for (int r = 0; r <= 32; r += 2) {
+			for (int c = 0; c <= 32; c += 2) {
+				assert(child->values[r * 33 + c] == parent->values[(r >> 1) * 33 + (c >> 1)]);
+			}
+		}
+
+		ar_destroy(reuse_cs);
+		printf("  [PASS] Hierarchical parent/child sample cache reuse verified (saved %d sampler calls/node)\n", 17 * 17);
+	}
+
+	/* Test 20: Progressive Per-Query Population Budget (max_populates_per_query) */
+	{
+		ar_system_t *prog_cs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                                 mock_sampler, NULL);
+		assert(prog_cs != NULL);
+
+		float eye[3] = { 0.0f, 900.0f, 1200.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, -1.0f, 0.0f };
+		float mv[16], proj[16], mvp[16];
+		ar_mat4_lookat(mv, eye, target, up);
+		ar_mat4_perspective(proj, 0.785398f, 16.0f / 9.0f, 2.0f, 200000.0f);
+		ar_mat4_multiply(mvp, proj, mv);
+
+		ar_cull_opts_t opts_budget = {
+			.z_min = -500.0f, .z_max = 500.0f,
+			.focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 100.0f, .target_quad_px = 2.0f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 0, .max_level = 10,
+			.view_id = 0,
+			.max_populates_per_query = 8
+		};
+
+		const ar_node_t *nodes[TEST_MAX_ACTIVE];
+		size_t n_f1 = ar_system_query_matrix(prog_cs, 1, mvp, &opts_budget, nodes, TEST_MAX_ACTIVE);
+		assert(n_f1 > 0);
+		ar_stats_t st_f1;
+		ar_system_get_stats(prog_cs, &st_f1);
+		assert(st_f1.cache_misses_total <= 16);
+
+		/* Subsequent frames progressively refine to full resolution until cache_misses stop growing */
+		size_t prev_misses = st_f1.cache_misses_total;
+		size_t n_final = n_f1;
+		for (int f = 0; f < 16; f++) {
+			ar_system_begin_frame(prog_cs);
+			n_final = ar_system_query_matrix(prog_cs, 1, mvp, &opts_budget, nodes, TEST_MAX_ACTIVE);
+			ar_stats_t st_cur;
+			ar_system_get_stats(prog_cs, &st_cur);
+			assert(st_cur.cache_misses_total - prev_misses <= 8);
+			prev_misses = st_cur.cache_misses_total;
+		}
+		assert(n_final >= n_f1);
+
+		ar_destroy(prog_cs);
+		printf("  [PASS] Progressive per-query population budget (max_populates_per_query=8) verified\n");
+	}
+
+	/* 21. Multi-scale LOD texel span helper (ar_level_texel_span) */
+	{
+		float span0 = ar_level_texel_span(16384, 32, 0);
+		float span2 = ar_level_texel_span(16384, 32, 2);
+		assert(fabsf(span0 - 512.0f) < 1e-4f);
+		assert(fabsf(span2 - 128.0f) < 1e-4f);
+		assert(ar_level_texel_span(16384, 0, 0) == 0.0f);
+		printf("  [PASS] ar_level_texel_span verified (L0=%.1f, L2=%.1f)\n", span0, span2);
+	}
+
+	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;
 }

@@ -382,13 +382,97 @@ bool ar_frustum_test_box(const ar_frustum_t *frustum,
 /* Vertical Bounds Envelope & Screen Projection Helpers                      */
 /* ========================================================================= */
 
-static inline void ar_compute_bounds_envelope(const ar_cull_opts_t *opts,
+static inline void ar_compute_bounds_envelope(const ar_system_t *sys,
+                                              const ar_cull_opts_t *opts,
+                                              float ox, float oy, float w, float h,
+                                              float *out_z_min, float *out_z_max);
+
+static inline float ar_projected_screen_width(const float mvp[16],
+                                              float ox, float oy, float w, float h,
+                                              float z_mid,
+                                              float vp_w, float vp_h)
+{
+	float cx = ox + w * 0.5f;
+	float cy = oy + h * 0.5f;
+
+	float cw = mvp[0 * 4 + 3] * cx +
+	           mvp[1 * 4 + 3] * cy +
+	           mvp[2 * 4 + 3] * z_mid +
+	           mvp[3 * 4 + 3] * 1.0f;
+
+	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
+
+	float len_row0 = sqrtf(mvp[0]*mvp[0] + mvp[4]*mvp[4] + mvp[8]*mvp[8]);
+	float len_row1 = sqrtf(mvp[1]*mvp[1] + mvp[5]*mvp[5] + mvp[9]*mvp[9]);
+	if (len_row0 < 1e-7f) len_row0 = 0.001f;
+	if (len_row1 < 1e-7f) len_row1 = 0.001f;
+
+	float w_eff = 1.0f;
+	if (is_perspective) {
+		if (cw <= 1.0f) return (vp_w > vp_h ? vp_w : vp_h) * 2.0f;
+		w_eff = cw;
+	}
+
+	float px_w = (w * len_row0 * vp_w * 0.5f) / w_eff;
+	float px_h = (h * len_row1 * vp_h * 0.5f) / w_eff;
+
+	return (px_w > px_h) ? px_w : px_h;
+}
+
+/* ========================================================================= */
+/* System Lifecycle & Single-Arena Buffer Management                         */
+/* ========================================================================= */
+
+typedef struct {
+	int32_t ox, oy;
+	uint8_t level;
+	float   proj_w;
+	float   dist_sq;
+	bool    active;
+	bool    split_blocked;
+} ar_candidate_t;
+
+struct ar_system {
+	int32_t           base_w;
+	int32_t           base_h;
+	uint16_t          grid_dim;
+	uint16_t          vert_dim;
+	uint32_t          vert_count;
+	uint16_t          pool_capacity;
+	uint16_t          max_active;
+	uint8_t           max_levels;
+	uint32_t          default_rgba;
+	float             z_min;
+	float             z_max;
+	float             target_quad_px;
+	float             margin;
+	ar_sampler_fn     sampler;
+	ar_sparsity_fn    sparsity;
+	void             *user_ctx;
+	uint32_t          current_tick;
+
+	/* Pointers into single contiguous allocation */
+	ar_node_t        *pool;
+	const ar_node_t **active_chunks;
+	ar_candidate_t   *cands_scratch;
+	ar_candidate_t   *active_cands_scratch;
+	size_t            active_count;
+
+	/* Backing libislet in-memory quadtree spatial database */
+	islet_quad_map_t  map;
+
+	/* Telemetry & diagnostics */
+	ar_stats_t        stats;
+};
+
+static inline void ar_compute_bounds_envelope(const ar_system_t *sys,
+                                              const ar_cull_opts_t *opts,
                                               float ox, float oy, float w, float h,
                                               float *out_z_min, float *out_z_max)
 {
-	float z_min = opts ? opts->z_min : -2000.0f;
-	float z_max = opts ? opts->z_max : 2000.0f;
-	float margin = opts ? opts->margin : 0.0f;
+	float z_min = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_min : sys->z_min;
+	float z_max = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_max : sys->z_max;
+	float margin = opts ? opts->margin : sys->margin;
 
 	if (opts && opts->bounds_fn) {
 		opts->bounds_fn(opts->bounds_ctx, ox, oy, w, h, &z_min, &z_max);
@@ -425,79 +509,6 @@ static inline void ar_compute_bounds_envelope(const ar_cull_opts_t *opts,
 	*out_z_max = z_max + margin;
 }
 
-static inline float ar_projected_screen_width(const float mvp[16],
-                                              float ox, float oy, float w, float h,
-                                              float z_mid,
-                                              float vp_w, float vp_h)
-{
-	float cx = ox + w * 0.5f;
-	float cy = oy + h * 0.5f;
-
-	float cw = mvp[0 * 4 + 3] * cx +
-	           mvp[1 * 4 + 3] * cy +
-	           mvp[2 * 4 + 3] * z_mid +
-	           mvp[3 * 4 + 3] * 1.0f;
-
-	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
-
-	float len_row0 = sqrtf(mvp[0]*mvp[0] + mvp[4]*mvp[4] + mvp[8]*mvp[8]);
-	float len_row1 = sqrtf(mvp[1]*mvp[1] + mvp[5]*mvp[5] + mvp[9]*mvp[9]);
-	if (len_row0 < 1e-7f) len_row0 = 0.001f;
-	if (len_row1 < 1e-7f) len_row1 = 0.001f;
-
-	float w_eff = 1.0f;
-	if (is_perspective) {
-		if (cw <= 1.0f) return (vp_w > vp_h ? vp_w : vp_h) * 2.0f;
-		w_eff = cw;
-	}
-
-	float px_w = (w * len_row0 * (vp_w > 0.0f ? vp_w : 1280.0f) * 0.5f) / w_eff;
-	float px_h = (h * len_row1 * (vp_h > 0.0f ? vp_h : 720.0f) * 0.5f) / w_eff;
-
-	return (px_w > px_h) ? px_w : px_h;
-}
-
-/* ========================================================================= */
-/* System Lifecycle & Single-Arena Buffer Management                         */
-/* ========================================================================= */
-
-typedef struct {
-	int32_t ox, oy;
-	uint8_t level;
-	float   proj_w;
-	float   dist_sq;
-	bool    active;
-} ar_candidate_t;
-
-struct ar_system {
-	int32_t           base_w;
-	int32_t           base_h;
-	uint16_t          grid_dim;
-	uint16_t          vert_dim;
-	uint32_t          vert_count;
-	uint16_t          pool_capacity;
-	uint16_t          max_active;
-	uint8_t           max_levels;
-	uint32_t          default_rgba;
-	ar_sampler_fn     sampler;
-	ar_sparsity_fn    sparsity;
-	void             *user_ctx;
-	uint32_t          current_tick;
-
-	/* Pointers into single contiguous allocation */
-	ar_node_t        *pool;
-	const ar_node_t **active_chunks;
-	ar_candidate_t   *cands_scratch;
-	ar_candidate_t   *active_cands_scratch;
-	size_t            active_count;
-
-	/* Backing libislet in-memory quadtree spatial database */
-	islet_quad_map_t  map;
-
-	/* Telemetry & diagnostics */
-	ar_stats_t        stats;
-};
-
 static inline size_t ar_align8(size_t n)
 {
 	return (n + 7u) & ~(size_t)7u;
@@ -505,16 +516,18 @@ static inline size_t ar_align8(size_t n)
 
 ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 {
-	if (!cfg || cfg->base_w <= 0 || cfg->base_h <= 0 || !cfg->sampler)
+	if (!cfg || cfg->base_w <= 0 || cfg->base_h <= 0 ||
+	    cfg->grid_dim == 0 || cfg->pool_capacity == 0 ||
+	    cfg->max_active == 0 || cfg->max_levels == 0 || !cfg->sampler)
 		return NULL;
 
-	uint16_t grid_dim = cfg->grid_dim ? cfg->grid_dim : AR_DEFAULT_GRID_DIM;
+	uint16_t grid_dim = cfg->grid_dim;
 	uint16_t vert_dim = (uint16_t)(grid_dim + 1u);
 	uint32_t vert_count = (uint32_t)vert_dim * (uint32_t)vert_dim;
-	uint16_t pool_cap = cfg->pool_capacity ? cfg->pool_capacity : AR_DEFAULT_POOL_CAPACITY;
-	uint16_t max_act = cfg->max_active ? cfg->max_active : AR_DEFAULT_MAX_ACTIVE;
-	uint8_t max_lvls = cfg->max_levels ? cfg->max_levels : AR_DEFAULT_MAX_LEVELS;
-	uint32_t def_rgba = cfg->default_rgba ? cfg->default_rgba : AR_DEFAULT_FALLBACK_RGBA;
+	uint16_t pool_cap = cfg->pool_capacity;
+	uint16_t max_act = cfg->max_active;
+	uint8_t max_lvls = cfg->max_levels;
+	uint32_t def_rgba = cfg->default_rgba;
 
 	size_t sys_bytes = ar_align8(sizeof(ar_system_t));
 	size_t pool_bytes = ar_align8((size_t)pool_cap * sizeof(ar_node_t));
@@ -570,6 +583,10 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->max_active = max_act;
 	sys->max_levels = max_lvls;
 	sys->default_rgba = def_rgba;
+	sys->z_min = (cfg->z_min != 0.0f || cfg->z_max != 0.0f) ? cfg->z_min : -((float)cfg->base_h * 16.0f);
+	sys->z_max = (cfg->z_min != 0.0f || cfg->z_max != 0.0f) ? cfg->z_max : ((float)cfg->base_h * 16.0f);
+	sys->target_quad_px = (cfg->target_quad_px > 0.0f) ? cfg->target_quad_px : 1.0f;
+	sys->margin = (cfg->margin >= 0.0f) ? cfg->margin : 0.0f;
 	sys->sampler = cfg->sampler;
 	sys->sparsity = cfg->sparsity;
 	sys->user_ctx = cfg->user_ctx;
@@ -588,6 +605,10 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 }
 
 ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
+                              uint16_t grid_dim,
+                              uint16_t pool_capacity,
+                              uint16_t max_active,
+                              uint8_t max_levels,
                               ar_sampler_fn sampler,
                               ar_sparsity_fn sparsity,
                               void *user_ctx)
@@ -596,6 +617,10 @@ ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.base_w = base_w;
 	cfg.base_h = base_h;
+	cfg.grid_dim = grid_dim;
+	cfg.pool_capacity = pool_capacity;
+	cfg.max_active = max_active;
+	cfg.max_levels = max_levels;
 	cfg.sampler = sampler;
 	cfg.sparsity = sparsity;
 	cfg.user_ctx = user_ctx;
@@ -621,6 +646,8 @@ void ar_system_clear(ar_system_t *sys)
 	}
 	islet_quad_map_clear(&sys->map);
 	sys->active_count = 0;
+	sys->stats.pool_in_use = 0;
+	sys->stats.active_chunks_last_frame = 0;
 }
 
 void ar_system_begin_frame(ar_system_t *sys)
@@ -722,21 +749,87 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		}
 	}
 
-	/* 4. Evaluate sample grid: (grid_dim + 1) x (grid_dim + 1) vertices */
+	/* 4. Evaluate sample grid: (grid_dim + 1) x (grid_dim + 1) vertices.
+	 * Reuse already-cached parent or child nodes at even grid points to separate
+	 * field computation caching from per-view rendering. */
 	int32_t gdim = (int32_t)sys->grid_dim;
-	int32_t step_x = node->w / gdim;
-	int32_t step_y = node->h / gdim;
-	if (step_x < 1) step_x = 1;
-	if (step_y < 1) step_y = 1;
+	if (gdim < 1) gdim = 1;
+	int32_t vdim = gdim + 1;
+	int32_t half_gdim = gdim >> 1;
+	bool can_reuse_hierarchy = ((gdim & 1) == 0 && half_gdim > 0);
+
+	const ar_node_t *parent_node = NULL;
+	int parent_r_off = 0, parent_c_off = 0;
+	const ar_node_t *child_nodes[4] = { NULL, NULL, NULL, NULL };
+
+	if (can_reuse_hierarchy) {
+		uint64_t pkey = morton_quad_parent(key);
+		if (pkey != key) {
+			uint32_t pslot = 0;
+			if (islet_quad_map_get(&sys->map, pkey, &pslot) &&
+			    pslot < sys->pool_capacity && sys->pool[pslot].state == 1 &&
+			    sys->pool[pslot].world == world && sys->pool[pslot].level == level + 1) {
+				parent_node = &sys->pool[pslot];
+				uint8_t q = morton_quad_quadrant(key);
+				parent_c_off = (q & 1) ? half_gdim : 0;
+				parent_r_off = (q & 2) ? half_gdim : 0;
+			}
+		}
+		if (level > 0) {
+			for (uint8_t q = 0; q < 4; q++) {
+				uint64_t ckey = morton_quad_child(key, q);
+				uint32_t cslot = 0;
+				if (islet_quad_map_get(&sys->map, ckey, &cslot) &&
+				    cslot < sys->pool_capacity && sys->pool[cslot].state == 1 &&
+				    sys->pool[cslot].world == world && sys->pool[cslot].level == level - 1) {
+					child_nodes[q] = &sys->pool[cslot];
+				}
+			}
+		}
+	}
 
 	size_t idx = 0;
 	for (int r = 0; r <= gdim; r++) {
-		int32_t wy = oy + r * step_y;
+		int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
 		for (int c = 0; c <= gdim; c++) {
-			int32_t wx = ox + c * step_x;
+			int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
 			ar_sample_t *s = &node->samples[idx];
-			sys->sampler(sys->user_ctx, world, level, wx, wy, s);
-			sys->stats.sampler_invocations_total++;
+			bool reused = false;
+
+			/* Check cached finer child first (every grid point (c, r) in parent maps to
+			 * even grid point (2*(c - qx*half), 2*(r - qy*half)) in child quadrant q) */
+			if (can_reuse_hierarchy) {
+				int qx = (c > half_gdim) ? 1 : 0;
+				int qy = (r > half_gdim) ? 1 : 0;
+				uint8_t q = (uint8_t)(qx | (qy << 1));
+				const ar_node_t *cn = child_nodes[q];
+				if (cn) {
+					int cc = (c - (qx ? half_gdim : 0)) * 2;
+					int cr = (r - (qy ? half_gdim : 0)) * 2;
+					int32_t c_wx = cn->ox + (int32_t)(((int64_t)cc * cn->w) / gdim);
+					int32_t c_wy = cn->oy + (int32_t)(((int64_t)cr * cn->h) / gdim);
+					if (c_wx == wx && c_wy == wy) {
+						*s = cn->samples[cr * vdim + cc];
+						reused = true;
+					}
+				}
+				/* Otherwise check cached parent at even grid coordinates */
+				if (!reused && parent_node && ((r & 1) == 0) && ((c & 1) == 0)) {
+					int pr = parent_r_off + (r >> 1);
+					int pc = parent_c_off + (c >> 1);
+					int32_t p_wx = parent_node->ox + (int32_t)(((int64_t)pc * parent_node->w) / gdim);
+					int32_t p_wy = parent_node->oy + (int32_t)(((int64_t)pr * parent_node->h) / gdim);
+					if (p_wx == wx && p_wy == wy) {
+						*s = parent_node->samples[pr * vdim + pc];
+						reused = true;
+					}
+				}
+			}
+
+			if (!reused) {
+				sys->sampler(sys->user_ctx, world, level, wx, wy, s);
+				sys->stats.sampler_invocations_total++;
+			}
 
 			if (s->val < node->min_val) node->min_val = s->val;
 			if (s->val > node->max_val) node->max_val = s->val;
@@ -812,16 +905,12 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	float fx = opts ? opts->focal_x : 0.0f;
 	float fy = opts ? opts->focal_y : 0.0f;
 	float sag_r = opts ? opts->sag_radius : 0.0f;
-	float margin = (opts && opts->margin > 0.0f) ? opts->margin : 150.0f;
-	float vp_w = (opts && opts->viewport_w > 0.0f) ? opts->viewport_w : 1280.0f;
-	float vp_h = (opts && opts->viewport_h > 0.0f) ? opts->viewport_h : 720.0f;
+	float margin = (opts && opts->margin > 0.0f) ? opts->margin : sys->margin;
+	float vp_w = (opts && opts->viewport_w > 0.0f) ? opts->viewport_w : (float)(sys->base_w * 8);
+	float vp_h = (opts && opts->viewport_h > 0.0f) ? opts->viewport_h : (float)(sys->base_h * 6);
 
-	float z_min = opts ? opts->z_min : -2000.0f;
-	float z_max = opts ? opts->z_max : 2000.0f;
-	if (z_min == 0.0f && z_max == 0.0f) {
-		z_min = -2000.0f;
-		z_max = 2000.0f;
-	}
+	float z_min = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_min : sys->z_min;
+	float z_max = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_max : sys->z_max;
 	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
 	float focal_pt[4] = { fx, fy, 0.0f, 1.0f };
 	float focal_clip[4];
@@ -839,7 +928,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		eff_z_min -= max_sag;
 	}
 	float eff_z_max = z_max;
-	float max_ray_span = is_perspective ? ((dist * 6.0f > 2000.0f) ? (dist * 6.0f) : 2000.0f) : 100000000.0f;
+	float z_span = fabsf(z_max - z_min);
+	float max_ray_span = is_perspective ? ((dist * 6.0f > z_span) ? (dist * 6.0f) : z_span) : 100000000.0f;
 
 	float len_row0 = sqrtf(mvp[0]*mvp[0] + mvp[4]*mvp[4] + mvp[8]*mvp[8]);
 	float len_row1 = sqrtf(mvp[1]*mvp[1] + mvp[5]*mvp[5] + mvp[9]*mvp[9]);
@@ -885,7 +975,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			float dz = p_far[2] - p_near[2];
 
 			if (fabsf(dz) > 1e-6f) {
-				float t0 = -p_near[2] / dz;
+				float z_mid = (eff_z_min + eff_z_max) * 0.5f;
+				float t0 = (z_mid - p_near[2]) / dz;
 				if (t0 >= -0.2f && t0 <= 1.2f) {
 					float ix = p_near[0] + t0 * dx;
 					float iy = p_near[1] + t0 * dy;
@@ -985,7 +1076,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	int32_t j0 = ar_fdiv((int32_t)bb_min_y, root_h);
 	int32_t j1 = ar_fdiv((int32_t)bb_max_y, root_h);
 
-	while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16 && root_level + 1 < sys->max_levels) {
+	uint8_t eff_max_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
+		? opts->max_level : (uint8_t)(sys->max_levels - 1);
+	while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16 && root_level < eff_max_lvl) {
 		root_level++;
 		root_w = sys->base_w << root_level;
 		root_h = sys->base_h << root_level;
@@ -993,6 +1086,23 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		i1 = ar_fdiv((int32_t)bb_max_x, root_w);
 		j0 = ar_fdiv((int32_t)bb_min_y, root_h);
 		j1 = ar_fdiv((int32_t)bb_max_y, root_h);
+	}
+
+	/* Cap grid span to at most one full world period (1 << (sys->max_levels - 1 - root_level))
+	 * so periodic/toroidal worlds never spawn duplicate wrapped chunks overlapping in 3D. */
+	if (sys->max_levels > 1 && root_level < sys->max_levels - 1) {
+		int64_t max_period_cells = (int64_t)1 << (sys->max_levels - 1 - root_level);
+		if (max_period_cells > 4) max_period_cells = 4;
+		if ((int64_t)i1 - i0 + 1 > max_period_cells) {
+			int32_t ic = ar_fdiv((int32_t)fx, root_w);
+			i0 = ic - (int32_t)(max_period_cells / 2);
+			i1 = i0 + (int32_t)max_period_cells - 1;
+		}
+		if ((int64_t)j1 - j0 + 1 > max_period_cells) {
+			int32_t jc = ar_fdiv((int32_t)fy, root_h);
+			j0 = jc - (int32_t)(max_period_cells / 2);
+			j1 = j0 + (int32_t)max_period_cells - 1;
+		}
 	}
 
 	ar_candidate_t *cands = sys->cands_scratch;
@@ -1003,7 +1113,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			int32_t rox = i * root_w;
 			int32_t roy = j * root_h;
 			float node_z_min, node_z_max;
-			ar_compute_bounds_envelope(opts, (float)rox, (float)roy, (float)root_w, (float)root_h,
+			ar_compute_bounds_envelope(sys, opts, (float)rox, (float)roy, (float)root_w, (float)root_h,
 			                           &node_z_min, &node_z_max);
 
 			if (ar_frustum_test_box(&frustum, (float)rox, (float)roy, node_z_min,
@@ -1020,27 +1130,69 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 					cands[cand_count].dist_sq = ar_dist_to_box_sq(fx, fy, (float)rox, (float)roy,
 					                                              (float)root_w, (float)root_h);
 					cands[cand_count].active = true;
+					cands[cand_count].split_blocked = false;
 					cand_count++;
 				}
 			}
 		}
 	}
 
-	/* 5. Priority Refinement Loop */
-	float target_quad_px = (opts && opts->target_quad_px > 0.0f) ? opts->target_quad_px : 2.0f;
+	/* 5. Priority Refinement Loop (with optional split/merge hysteresis and per-query populate budget) */
+	float target_quad_px = (opts && opts->target_quad_px > 0.0f) ? opts->target_quad_px : sys->target_quad_px;
 	float split_threshold = target_quad_px * (float)sys->grid_dim;
+	float hyst = (opts && opts->split_hysteresis > 0.0f) ? opts->split_hysteresis : 0.0f;
+	if (hyst > 0.45f) hyst = 0.45f;
+	uint8_t view_mask = (opts && opts->view_id < 8) ? (uint8_t)(1u << opts->view_id) : 1u;
 	uint8_t min_lvl = opts ? opts->min_level : 0;
+	uint16_t max_pops = opts ? opts->max_populates_per_query : 0;
+	uint32_t pops_used = 0;
+
+	if (max_pops > 0) {
+		for (size_t k = 0; k < cand_count; k++) {
+			if (!cands[k].active) continue;
+			uint64_t rkey = morton_quad_key(world, cands[k].level, cands[k].ox, cands[k].oy,
+			                                sys->base_w, sys->base_h);
+			uint32_t rslot = 0;
+			bool cached = (islet_quad_map_get(&sys->map, rkey, &rslot) &&
+			               rslot < sys->pool_capacity && sys->pool[rslot].state == 1);
+			if (!cached)
+				pops_used++;
+			(void)ar_get_or_populate(sys, world, cands[k].level, cands[k].ox, cands[k].oy);
+		}
+	}
 
 	while (cand_count + 3 <= max_candidates) {
 		int best_idx = -1;
-		float max_err = split_threshold;
+		float best_ratio = 1.0f;
 
 		for (size_t k = 0; k < cand_count; k++) {
-			if (!cands[k].active || cands[k].level <= min_lvl)
+			if (!cands[k].active || cands[k].split_blocked || cands[k].level <= min_lvl)
 				continue;
-			if (cands[k].proj_w > max_err ||
-			    (cands[k].proj_w == max_err && best_idx >= 0 && cands[k].dist_sq < cands[best_idx].dist_sq)) {
-				max_err = cands[k].proj_w;
+
+			float node_thresh = split_threshold;
+			if (hyst > 0.0f) {
+				uint64_t pkey = morton_quad_key(world, cands[k].level, cands[k].ox, cands[k].oy,
+				                                sys->base_w, sys->base_h);
+				bool kids_were_active = false;
+				for (uint8_t q = 0; q < 4; q++) {
+					uint64_t ckey = morton_quad_child(pkey, q);
+					uint32_t cslot = 0;
+					if (islet_quad_map_get(&sys->map, ckey, &cslot) &&
+					    cslot < sys->pool_capacity && sys->pool[cslot].state == 1 &&
+					    (sys->pool[cslot].active_view_mask & view_mask) != 0) {
+						kids_were_active = true;
+						break;
+					}
+				}
+				/* If children were already active in this view, keep them split down to (1 - hyst);
+				 * if this node was unsplit, require (1 + hyst) before splitting. */
+				node_thresh *= kids_were_active ? (1.0f - hyst) : (1.0f + hyst);
+			}
+
+			float ratio = (node_thresh > 1e-5f) ? (cands[k].proj_w / node_thresh) : 0.0f;
+			if (ratio > best_ratio ||
+			    (ratio == best_ratio && best_idx >= 0 && cands[k].dist_sq < cands[best_idx].dist_sq)) {
+				best_ratio = ratio;
 				best_idx = (int)k;
 			}
 		}
@@ -1059,14 +1211,17 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			float   proj_w;
 			float   dist_sq;
 			bool    visible;
+			bool    cached;
 		} kids[4];
 		size_t vis_kids = 0;
+		uint32_t uncached_vis_kids = 0;
 
 		for (int c = 0; c < 4; c++) {
 			kids[c].ox = pox + ((c & 1) ? cw : 0);
 			kids[c].oy = poy + ((c & 2) ? ch : 0);
+			kids[c].cached = false;
 			float kid_z_min, kid_z_max;
-			ar_compute_bounds_envelope(opts, (float)kids[c].ox, (float)kids[c].oy,
+			ar_compute_bounds_envelope(sys, opts, (float)kids[c].ox, (float)kids[c].oy,
 			                           (float)cw, (float)ch, &kid_z_min, &kid_z_max);
 			kids[c].visible = ar_frustum_test_box(&frustum,
 			                                      (float)kids[c].ox, (float)kids[c].oy, kid_z_min,
@@ -1077,6 +1232,15 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				                                           (float)cw, (float)ch, z_mid, vp_w, vp_h);
 				kids[c].dist_sq = ar_dist_to_box_sq(fx, fy, (float)kids[c].ox, (float)kids[c].oy,
 				                                     (float)cw, (float)ch);
+				if (max_pops > 0) {
+					uint64_t ckey = morton_quad_key(world, child_lvl, kids[c].ox, kids[c].oy,
+					                                sys->base_w, sys->base_h);
+					uint32_t cslot = 0;
+					kids[c].cached = (islet_quad_map_get(&sys->map, ckey, &cslot) &&
+					                  cslot < sys->pool_capacity && sys->pool[cslot].state == 1);
+					if (!kids[c].cached)
+						uncached_vis_kids++;
+				}
 				vis_kids++;
 			}
 		}
@@ -1086,8 +1250,24 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			continue;
 		}
 
+		if (max_pops > 0 && uncached_vis_kids > 0 && pops_used + uncached_vis_kids > max_pops) {
+			cands[best_idx].split_blocked = true;
+			continue;
+		}
+
 		if (cand_count + vis_kids - 1 > max_candidates)
 			break;
+
+		if (max_pops > 0) {
+			/* Ensure parent is populated first so children reuse 25% of even-grid vertices */
+			(void)ar_get_or_populate(sys, world, cands[best_idx].level, pox, poy);
+			for (int c = 0; c < 4; c++) {
+				if (kids[c].visible) {
+					(void)ar_get_or_populate(sys, world, child_lvl, kids[c].ox, kids[c].oy);
+				}
+			}
+			pops_used += uncached_vis_kids;
+		}
 
 		bool replaced = false;
 		for (int c = 0; c < 4; c++) {
@@ -1099,6 +1279,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				cands[best_idx].proj_w = kids[c].proj_w;
 				cands[best_idx].dist_sq = kids[c].dist_sq;
 				cands[best_idx].active = true;
+				cands[best_idx].split_blocked = false;
 				replaced = true;
 			} else {
 				cands[cand_count].ox = kids[c].ox;
@@ -1107,6 +1288,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				cands[cand_count].proj_w = kids[c].proj_w;
 				cands[cand_count].dist_sq = kids[c].dist_sq;
 				cands[cand_count].active = true;
+				cands[cand_count].split_blocked = false;
 				cand_count++;
 			}
 		}
@@ -1132,12 +1314,20 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		active_cands[b] = key;
 	}
 
+	for (size_t i = 0; i < sys->pool_capacity; i++) {
+		if (sys->pool[i].state == 1 && sys->pool[i].world == world) {
+			sys->pool[i].active_view_mask &= (uint8_t)~view_mask;
+		}
+	}
+
 	for (size_t i = 0; i < active_count && out_count < max_candidates; i++) {
 		ar_node_t *node = ar_get_or_populate(sys, world,
 		                                     active_cands[i].level,
 		                                     active_cands[i].ox,
 		                                     active_cands[i].oy);
 		if (node) {
+			node->active_view_mask |= view_mask;
+			node->last_touch_frame = sys->current_tick;
 			out_nodes[out_count++] = node;
 			if (node->level > sys->stats.max_level_observed)
 				sys->stats.max_level_observed = node->level;
@@ -1180,7 +1370,7 @@ size_t ar_system_update(ar_system_t *sys, uint16_t world,
 		return 0;
 
 	float zoom = (view->zoom > 0.0f) ? view->zoom : 1.0f;
-	float eff_cam_dist = (view->eff_cam_dist > 1.0f) ? view->eff_cam_dist : 280.0f;
+	float eff_cam_dist = (view->eff_cam_dist > 1.0f) ? view->eff_cam_dist : (float)(sys->base_w * 2);
 	float eye_dist = eff_cam_dist / zoom;
 
 	float eye[3], target[3], up[3];
@@ -1191,12 +1381,12 @@ size_t ar_system_update(ar_system_t *sys, uint16_t world,
 	if (view->fov <= 0.001f && view->pitch <= 0.001f) {
 		eye[0] = view->cam_x;
 		eye[1] = view->cam_y;
-		eye[2] = view->cam_z + (eye_dist > 100.0f ? eye_dist : 500.0f);
+		eye[2] = view->cam_z + (eye_dist > 100.0f ? eye_dist : (float)(sys->base_h * 4));
 		up[0] = 0.0f;
 		up[1] = -1.0f;
 		up[2] = 0.0f;
 	} else {
-		float pitch = (view->pitch > 0.001f) ? view->pitch : (55.0f * 3.14159265f / 180.0f);
+		float pitch = (view->pitch > 0.001f) ? view->pitch : 0.959931f;
 		float cos_p = cosf(pitch);
 		float sin_p = sinf(pitch);
 		eye[0] = view->cam_x;
@@ -1210,32 +1400,33 @@ size_t ar_system_update(ar_system_t *sys, uint16_t world,
 	float modelview[16], proj[16], mvp[16];
 	ar_mat4_lookat(modelview, eye, target, up);
 
-	float vp_w = (view->viewport_w > 0.0f) ? view->viewport_w : 1280.0f;
-	float vp_h = (view->viewport_h > 0.0f) ? view->viewport_h : 720.0f;
+	float vp_w = (view->viewport_w > 0.0f) ? view->viewport_w : (float)(sys->base_w * 8);
+	float vp_h = (view->viewport_h > 0.0f) ? view->viewport_h : (float)(sys->base_h * 6);
 
 	if (view->fov <= 0.001f) {
 		float hw = (vp_w * 0.5f) / zoom;
 		float hh = (vp_h * 0.5f) / zoom;
-		float near_z = (eye_dist * 2.0f > 2000.0f) ? (-eye_dist * 2.0f) : -2000.0f;
-		float far_z = (eye_dist * 2.0f > 2000.0f) ? (eye_dist * 2.0f) : 2000.0f;
+		float z_bound = fabsf(sys->z_max - sys->z_min);
+		float near_z = (eye_dist * 2.0f > z_bound) ? (-eye_dist * 2.0f) : -z_bound;
+		float far_z = (eye_dist * 2.0f > z_bound) ? (eye_dist * 2.0f) : z_bound;
 		ar_mat4_ortho(proj, -hw, hw, -hh, hh, near_z, far_z);
 	} else {
 		float aspect = vp_w / vp_h;
 		float near_z = (eye_dist * 0.001f > 1.0f) ? (eye_dist * 0.001f) : 1.0f;
-		float far_z = (eye_dist * 10.0f > 50000.0f) ? (eye_dist * 10.0f) : 50000.0f;
+		float far_z = (eye_dist * 10.0f > fabsf(sys->z_max - sys->z_min) * 12.0f) ? (eye_dist * 10.0f) : (fabsf(sys->z_max - sys->z_min) * 12.0f);
 		ar_mat4_perspective(proj, view->fov, aspect, near_z, far_z);
 	}
 	ar_mat4_multiply(mvp, proj, modelview);
 
 	ar_cull_opts_t opts;
 	memset(&opts, 0, sizeof(opts));
-	opts.z_min = -2000.0f;
-	opts.z_max = 2000.0f;
+	opts.z_min = sys->z_min;
+	opts.z_max = sys->z_max;
 	opts.sag_radius = 0.0f;
 	opts.focal_x = view->cam_x;
 	opts.focal_y = view->cam_y;
-	opts.margin = (view->fov <= 0.001f) ? 0.0f : 150.0f;
-	opts.target_quad_px = 2.0f;
+	opts.margin = (view->fov <= 0.001f) ? 0.0f : sys->margin;
+	opts.target_quad_px = sys->target_quad_px;
 	opts.viewport_w = vp_w;
 	opts.viewport_h = vp_h;
 	opts.min_level = view->min_level;
@@ -1301,21 +1492,110 @@ size_t ar_system_eval_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
 	return count;
 }
 
-bool ar_system_probe(ar_system_t *sys, uint16_t world,
-                     int32_t wx, int32_t wy,
-                     ar_sample_t *out)
+size_t ar_system_eval_ortho(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                            float center_x, float center_y,
+                            float world_w, float world_h,
+                            float viewport_w, float viewport_h)
+{
+	if (!sys || world_w <= 0.0f || world_h <= 0.0f)
+		return 0;
+
+	sys->current_tick++;
+	uint8_t view_mask = (uint8_t)(1u << (view_id & 7u));
+	for (size_t i = 0; i < sys->pool_capacity; i++) {
+		if (sys->pool[i].state == 1 && sys->pool[i].world == world) {
+			sys->pool[i].active_view_mask &= (uint8_t)~view_mask;
+		}
+	}
+
+	float vp_w = (viewport_w > 1.0f) ? viewport_w : world_w;
+	float vp_h = (viewport_h > 1.0f) ? viewport_h : world_h;
+	float units_per_px_x = world_w / vp_w;
+	float units_per_px_y = world_h / vp_h;
+	float target_sample_step = (units_per_px_x > units_per_px_y) ? units_per_px_x : units_per_px_y;
+
+	float min_x = center_x - world_w * 0.5f;
+	float max_x = center_x + world_w * 0.5f;
+	float min_y = center_y - world_h * 0.5f;
+	float max_y = center_y + world_h * 0.5f;
+
+	uint8_t max_lvl = (uint8_t)(sys->max_levels - 1u);
+	uint8_t level = 0;
+	while (level < max_lvl) {
+		int32_t cw = sys->base_w << level;
+		int32_t ch = sys->base_h << level;
+		int32_t i0 = ar_fdiv((int32_t)min_x, cw);
+		int32_t i1 = ar_fdiv((int32_t)max_x, cw);
+		int32_t j0 = ar_fdiv((int32_t)min_y, ch);
+		int32_t j1 = ar_fdiv((int32_t)max_y, ch);
+		int64_t cols = (int64_t)i1 - i0 + 1;
+		int64_t rows = (int64_t)j1 - j0 + 1;
+
+		int32_t next_cw = sys->base_w << (level + 1);
+		float next_step = (float)next_cw / (float)sys->grid_dim;
+
+		if (cols > 0 && rows > 0 && cols * rows <= 16 && next_step > target_sample_step * 1.25f)
+			break;
+		level++;
+	}
+
+	int32_t cw = sys->base_w << level;
+	int32_t ch = sys->base_h << level;
+	int32_t i0 = ar_fdiv((int32_t)min_x, cw);
+	int32_t i1 = ar_fdiv((int32_t)max_x, cw);
+	int32_t j0 = ar_fdiv((int32_t)min_y, ch);
+	int32_t j1 = ar_fdiv((int32_t)max_y, ch);
+
+	size_t count = 0;
+	for (int32_t j = j0; j <= j1; j++) {
+		for (int32_t i = i0; i <= i1; i++) {
+			ar_node_t *node = ar_get_or_populate(sys, world, level, i * cw, j * ch);
+			if (node) {
+				node->active_view_mask |= view_mask;
+				node->last_touch_frame = sys->current_tick;
+				count++;
+			}
+		}
+	}
+	return count;
+}
+
+static bool ar_probe_internal(ar_system_t *sys, uint8_t view_mask, uint16_t world,
+                              int32_t wx, int32_t wy,
+                              ar_sample_t *out)
 {
 	if (!sys || !out)
 		return false;
 
 	uint64_t key0 = morton_quad_key(world, 0, wx, wy, sys->base_w, sys->base_h);
-	uint32_t slot = 0;
-	uint8_t found_lvl = 0;
+	uint8_t max_lvl = (sys->max_levels > 0) ? (uint8_t)(sys->max_levels - 1) : 16;
 	const ar_node_t *best_node = NULL;
 
-	if (islet_quad_map_find_ancestor(&sys->map, key0, 4, &slot, &found_lvl)) {
-		if (slot < sys->pool_capacity && sys->pool[slot].state == 1) {
-			best_node = &sys->pool[slot];
+	/* 1. If a specific view_mask is requested, prefer the node active in that view */
+	if (view_mask != 0) {
+		uint64_t key = key0;
+		for (uint8_t lvl = 0; lvl <= max_lvl; lvl++) {
+			uint32_t slot = 0;
+			if (islet_quad_map_get(&sys->map, key, &slot)) {
+				if (slot < sys->pool_capacity && sys->pool[slot].state == 1 &&
+				    (sys->pool[slot].active_view_mask & view_mask) != 0) {
+					best_node = &sys->pool[slot];
+					break;
+				}
+			}
+			key = morton_quad_parent(key);
+		}
+	}
+
+	/* 2. Fallback to finest cached ancestor (up to max_lvl for view probes, 4 for ground probes) */
+	if (!best_node) {
+		uint32_t slot = 0;
+		uint8_t found_lvl = 0;
+		uint8_t cap_lvl = (view_mask != 0) ? max_lvl : (max_lvl < 4 ? max_lvl : 4);
+		if (islet_quad_map_find_ancestor(&sys->map, key0, cap_lvl, &slot, &found_lvl)) {
+			if (slot < sys->pool_capacity && sys->pool[slot].state == 1) {
+				best_node = &sys->pool[slot];
+			}
 		}
 	}
 
@@ -1337,6 +1617,10 @@ bool ar_system_probe(ar_system_t *sys, uint16_t world,
 
 		float u = fx - (float)col0;
 		float v = fy - (float)row0;
+		if (u < 0.0f) u = 0.0f;
+		if (u > 1.0f) u = 1.0f;
+		if (v < 0.0f) v = 0.0f;
+		if (v > 1.0f) v = 1.0f;
 		float wu = u * u * (3.0f - 2.0f * u);
 		float wv = v * v * (3.0f - 2.0f * v);
 
@@ -1350,14 +1634,11 @@ bool ar_system_probe(ar_system_t *sys, uint16_t world,
 		float h  = h0 * (1.0f - wv) + h1 * wv;
 		out->val = (int16_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
 
+		const ar_sample_t *s_near = (u < 0.5f)
+		                            ? ((v < 0.5f) ? s00 : s01)
+		                            : ((v < 0.5f) ? s10 : s11);
 		for (int k = 0; k < 8; k++) {
-			float a0 = (float)s00->attr[k] * (1.0f - wu) + (float)s10->attr[k] * wu;
-			float a1 = (float)s01->attr[k] * (1.0f - wu) + (float)s11->attr[k] * wu;
-			float a  = a0 * (1.0f - wv) + a1 * wv;
-			int ival = (int)(a + 0.5f);
-			if (ival < 0) ival = 0;
-			if (ival > 255) ival = 255;
-			out->attr[k] = (uint8_t)ival;
+			out->attr[k] = s_near->attr[k];
 		}
 
 		uint32_t c00 = s00->rgba, c10 = s10->rgba, c01 = s01->rgba, c11 = s11->rgba;
@@ -1380,12 +1661,27 @@ bool ar_system_probe(ar_system_t *sys, uint16_t world,
 			else a_b = (uint32_t)ival << 24;
 		}
 		out->rgba = r_b | g_b | b_b | a_b;
-		out->flags = s00->flags | s10->flags | s01->flags | s11->flags;
+		out->flags = s_near->flags;
 		return true;
 	}
 
 	sys->sampler(sys->user_ctx, world, 0, wx, wy, out);
 	return true;
+}
+
+bool ar_system_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                          int32_t wx, int32_t wy,
+                          ar_sample_t *out)
+{
+	uint8_t view_mask = (uint8_t)(1u << (view_id & 7u));
+	return ar_probe_internal(sys, view_mask, world, wx, wy, out);
+}
+
+bool ar_system_probe(ar_system_t *sys, uint16_t world,
+                     int32_t wx, int32_t wy,
+                     ar_sample_t *out)
+{
+	return ar_probe_internal(sys, 0, world, wx, wy, out);
 }
 
 void ar_system_get_stats(const ar_system_t *sys, ar_stats_t *out_stats)
