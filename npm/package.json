@@ -18,10 +18,10 @@
     "test": "node --test tests/areole.test.mjs"
   },
   "peerDependencies": {
-    "@tty-pt/stele": ">=1.6.1"
+    "@tty-pt/stele": ">=1.6.2"
   },
   "devDependencies": {
-    "@tty-pt/stele": "^1.6.1"
+    "@tty-pt/stele": "^1.6.2"
   },
   "keywords": [
     "areole",
