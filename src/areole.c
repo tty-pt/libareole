@@ -924,7 +924,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 	float eff_z_min = z_min;
 	if (sag_r > 0.0f) {
-		float max_sag = is_perspective ? ((dist * 1.5f < sag_r) ? (dist * 1.5f) : sag_r) : sag_r;
+		float reach = dist * 2.5f;
+		float sag_est = (reach * reach) / (2.0f * sag_r);
+		float max_sag = is_perspective ? ((sag_est < sag_r) ? sag_est : sag_r) : sag_r;
 		eff_z_min -= max_sag;
 	}
 	float eff_z_max = z_max;
@@ -1047,7 +1049,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		bb_max_y = fy + half_gh;
 	}
 
-	/* 4. Determine root level that naturally covers the bounding box (cols * rows <= 16) */
+	/* 4. Determine root level that naturally covers the bounding box (cols <= 4 && rows <= 4) */
 	uint8_t root_level = 0;
 	while (root_level + 1 < sys->max_levels) {
 		int32_t rw = sys->base_w << root_level;
@@ -1058,7 +1060,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		int32_t gj1 = ar_fdiv((int32_t)bb_max_y, rh);
 		int64_t cols = (int64_t)gi1 - gi0 + 1;
 		int64_t rows = (int64_t)gj1 - gj0 + 1;
-		if (cols > 0 && rows > 0 && cols * rows <= 16)
+		if (cols > 0 && rows > 0 && cols <= 4 && rows <= 4 && cols * rows <= 16)
 			break;
 		root_level++;
 	}
@@ -1078,7 +1080,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 	uint8_t eff_max_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
 		? opts->max_level : (uint8_t)(sys->max_levels - 1);
-	while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16 && root_level < eff_max_lvl) {
+	while ((((int64_t)i1 - i0 + 1) > 4 || ((int64_t)j1 - j0 + 1) > 4 ||
+	        ((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16) &&
+	       root_level < eff_max_lvl) {
 		root_level++;
 		root_w = sys->base_w << root_level;
 		root_h = sys->base_h << root_level;
@@ -1094,12 +1098,14 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		int64_t max_period_cells = (int64_t)1 << (sys->max_levels - 1 - root_level);
 		if (max_period_cells > 4) max_period_cells = 4;
 		if ((int64_t)i1 - i0 + 1 > max_period_cells) {
-			int32_t ic = ar_fdiv((int32_t)fx, root_w);
+			float mid_x = (bb_min_x + bb_max_x) * 0.5f;
+			int32_t ic = ar_fdiv((int32_t)mid_x, root_w);
 			i0 = ic - (int32_t)(max_period_cells / 2);
 			i1 = i0 + (int32_t)max_period_cells - 1;
 		}
 		if ((int64_t)j1 - j0 + 1 > max_period_cells) {
-			int32_t jc = ar_fdiv((int32_t)fy, root_h);
+			float mid_y = (bb_min_y + bb_max_y) * 0.5f;
+			int32_t jc = ar_fdiv((int32_t)mid_y, root_h);
 			j0 = jc - (int32_t)(max_period_cells / 2);
 			j1 = j0 + (int32_t)max_period_cells - 1;
 		}
