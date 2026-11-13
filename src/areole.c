@@ -946,11 +946,12 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		if (!opts) {
 			float c_near[3], c_far[3];
 			if (ar_unproject_ndc(inv_mvp, 0.0f, 0.0f, -1.0f, c_near) &&
-			    ar_unproject_ndc(inv_mvp, 0.0f, 0.0f,  1.0f, c_far)) {
+			    (ar_unproject_ndc(inv_mvp, 0.0f, 0.0f,  1.0f, c_far) ||
+			     ar_unproject_ndc(inv_mvp, 0.0f, 0.0f,  0.0f, c_far))) {
 				float c_dz = c_far[2] - c_near[2];
 				if (fabsf(c_dz) > 1e-6f) {
 					float tc = -c_near[2] / c_dz;
-					if (tc >= -0.5f && tc <= 1.5f) {
+					if (tc >= 0.0f) {
 						fx = c_near[0] + tc * (c_far[0] - c_near[0]);
 						fy = c_near[1] + tc * (c_far[1] - c_near[1]);
 					}
@@ -967,9 +968,13 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 		for (int k = 0; k < 4; k++) {
 			float p_near[3], p_far[3];
-			if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1], -1.0f, p_near) ||
-			    !ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1],  1.0f, p_far)) {
+			bool far_is_mid = false;
+			if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1], -1.0f, p_near))
 				continue;
+			if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1],  1.0f, p_far)) {
+				if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1], 0.0f, p_far))
+					continue;
+				far_is_mid = true;
 			}
 
 			float dx = p_far[0] - p_near[0];
@@ -978,41 +983,32 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 			if (fabsf(dz) > 1e-6f) {
 				float z_mid = (eff_z_min + eff_z_max) * 0.5f;
-				float t0 = (z_mid - p_near[2]) / dz;
-				if (t0 >= -0.2f && t0 <= 1.2f) {
-					float ix = p_near[0] + t0 * dx;
-					float iy = p_near[1] + t0 * dy;
-					if (ix >= -100000000.0f && ix <= 100000000.0f &&
-					    iy >= -100000000.0f && iy <= 100000000.0f) {
-						if (ix < bb_min_x) bb_min_x = ix;
-						if (ix > bb_max_x) bb_max_x = ix;
-						if (iy < bb_min_y) bb_min_y = iy;
-						if (iy > bb_max_y) bb_max_y = iy;
-						unproj_pts++;
-					}
-				}
-
-				if (!is_perspective || sag_r > 0.0f || (opts && opts->bounds_fn)) {
-					const float test_z[2] = { eff_z_min, eff_z_max };
-					for (int p = 0; p < 2; p++) {
-						float t = (test_z[p] - p_near[2]) / dz;
-						if (t >= -0.2f && t <= 1.2f) {
-							float ix = p_near[0] + t * dx;
-							float iy = p_near[1] + t * dy;
-							if (is_perspective) {
-								if (ix < fx - max_ray_span) ix = fx - max_ray_span;
-								if (ix > fx + max_ray_span) ix = fx + max_ray_span;
-								if (iy < fy - max_ray_span) iy = fy - max_ray_span;
-								if (iy > fy + max_ray_span) iy = fy + max_ray_span;
-							}
-							if (ix >= -100000000.0f && ix <= 100000000.0f &&
-							    iy >= -100000000.0f && iy <= 100000000.0f) {
-								if (ix < bb_min_x) bb_min_x = ix;
-								if (ix > bb_max_x) bb_max_x = ix;
-								if (iy < bb_min_y) bb_min_y = iy;
-								if (iy > bb_max_y) bb_max_y = iy;
-								unproj_pts++;
-							}
+				float z_ground = 0.0f;
+				if (z_ground < eff_z_min) z_ground = eff_z_min;
+				if (z_ground > eff_z_max) z_ground = eff_z_max;
+				float z_low  = is_perspective ? fmaxf(eff_z_min, z_ground - dist * 0.45f) : eff_z_min;
+				float z_high = is_perspective ? fminf(eff_z_max, z_ground + dist * 0.35f) : eff_z_max;
+				const float test_planes[4] = { z_ground, z_mid, z_low, z_high };
+				float t_min = is_perspective ? 0.0f : -0.2f;
+				float t_max = far_is_mid ? 1e6f : 1.2f;
+				for (int p = 0; p < 4; p++) {
+					float t = (test_planes[p] - p_near[2]) / dz;
+					if (t >= t_min && t <= t_max) {
+						float ix = p_near[0] + t * dx;
+						float iy = p_near[1] + t * dy;
+						if (is_perspective) {
+							if (ix < fx - max_ray_span) ix = fx - max_ray_span;
+							if (ix > fx + max_ray_span) ix = fx + max_ray_span;
+							if (iy < fy - max_ray_span) iy = fy - max_ray_span;
+							if (iy > fy + max_ray_span) iy = fy + max_ray_span;
+						}
+						if (ix >= -100000000.0f && ix <= 100000000.0f &&
+						    iy >= -100000000.0f && iy <= 100000000.0f) {
+							if (ix < bb_min_x) bb_min_x = ix;
+							if (ix > bb_max_x) bb_max_x = ix;
+							if (iy < bb_min_y) bb_min_y = iy;
+							if (iy > bb_max_y) bb_max_y = iy;
+							unproj_pts++;
 						}
 					}
 				}
@@ -1049,7 +1045,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		bb_max_y = fy + half_gh;
 	}
 
-	/* 4. Determine root level that naturally covers the bounding box (cols <= 4 && rows <= 4) */
+	/* 4. Determine root level that naturally covers the bounding box (cols * rows <= 16) */
 	uint8_t root_level = 0;
 	while (root_level + 1 < sys->max_levels) {
 		int32_t rw = sys->base_w << root_level;
@@ -1060,7 +1056,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		int32_t gj1 = ar_fdiv((int32_t)bb_max_y, rh);
 		int64_t cols = (int64_t)gi1 - gi0 + 1;
 		int64_t rows = (int64_t)gj1 - gj0 + 1;
-		if (cols > 0 && rows > 0 && cols <= 4 && rows <= 4 && cols * rows <= 16)
+		if (cols > 0 && rows > 0 && cols * rows <= 16)
 			break;
 		root_level++;
 	}
@@ -1080,8 +1076,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 	uint8_t eff_max_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
 		? opts->max_level : (uint8_t)(sys->max_levels - 1);
-	while ((((int64_t)i1 - i0 + 1) > 4 || ((int64_t)j1 - j0 + 1) > 4 ||
-	        ((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16) &&
+	while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > 16 &&
 	       root_level < eff_max_lvl) {
 		root_level++;
 		root_w = sys->base_w << root_level;
@@ -1096,7 +1091,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	 * so periodic/toroidal worlds never spawn duplicate wrapped chunks overlapping in 3D. */
 	if (sys->max_levels > 1 && root_level < sys->max_levels - 1) {
 		int64_t max_period_cells = (int64_t)1 << (sys->max_levels - 1 - root_level);
-		if (max_period_cells > 4) max_period_cells = 4;
+		if (root_level >= sys->max_levels - 3 && max_period_cells > 4)
+			max_period_cells = 4;
 		if ((int64_t)i1 - i0 + 1 > max_period_cells) {
 			float mid_x = (bb_min_x + bb_max_x) * 0.5f;
 			int32_t ic = ar_fdiv((int32_t)mid_x, root_w);
