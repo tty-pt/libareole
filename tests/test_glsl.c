@@ -114,6 +114,31 @@ int main(void)
 		printf("  [PASS] ar_glsl_ref_project column-major projection verified\n");
 	}
 
+	/* 6. Struct-driven ar_glsl_ref_eval_vertex and configurable sag_tangent_slope */
+	{
+		assert(strcmp(AR_UNIFORM_SAG_SLOPE, "uSagTangentSlope") == 0);
+		assert(sizeof(ar_glsl_uniforms_t) == 24 * sizeof(float));
+
+		ar_glsl_uniforms_t u;
+		memset(&u, 0, sizeof(u));
+		u.origin[0] = 0.0f; u.origin[1] = 0.0f;
+		u.span[0] = 25000.0f; u.span[1] = 1000.0f;
+		u.focal_center[0] = 0.0f; u.focal_center[1] = 0.0f;
+		u.curve_radius = 20000.0f;
+		u.sag_tangent_slope = 3.5f;
+		u.mvp[0] = 1.0f; u.mvp[5] = 1.0f; u.mvp[10] = 1.0f; u.mvp[15] = 1.0f;
+
+		float uv[2] = { 1.0f, 0.0f }; /* world_pos = (25000, 0), r = 25000 > R = 20000 */
+		float wpos[2], cpos[3], clip[4];
+		ar_glsl_ref_eval_vertex(&u, uv, 100.0f, wpos, cpos, clip);
+
+		/* Beyond horizon r = 25000 > 20000 with slope 3.5 -> sag = 20000 + 5000 * 3.5 = 37500 */
+		assert(fabsf(wpos[0] - 25000.0f) < 1e-4f);
+		assert(fabsf(cpos[2] - (100.0f - 37500.0f)) < 1e-2f);
+		assert(fabsf(clip[2] - cpos[2]) < 1e-2f);
+		printf("  [PASS] Struct-driven ar_glsl_ref_eval_vertex and configurable sag_tangent_slope verified\n");
+	}
+
 	printf("=== All GLSL ES 3.0 Parity Tests PASSED ===\n");
 	return 0;
 }

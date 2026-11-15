@@ -48,14 +48,15 @@ test("@tty-pt/areole: hierarchical level scaling with distance / zoom", () => {
   cs.destroy();
 });
 
-test("@tty-pt/areole: point elevation and attribute probe", () => {
+test("@tty-pt/areole: point scalar value and attribute probe", () => {
   const cs = createAreoleSystem(160, 128);
 
   const sample = cs.probe(0, 0);
   assert.ok(sample !== null, "Probe returned null at (0, 0)");
-  assert.equal(typeof sample.elevation, "number");
-  assert.ok(sample.biome >= 0 && sample.biome <= 255);
-  assert.ok(sample.waterDepth >= 0);
+  assert.equal(typeof sample.value, "number");
+  assert.equal(typeof sample.rgba, "number");
+  assert.equal(typeof sample.flags, "number");
+  assert.ok(Array.isArray(sample.attr) && sample.attr.length === 8);
 
   cs.destroy();
 });

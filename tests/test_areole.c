@@ -18,19 +18,19 @@ static void analytical_multioctave_sampler(void *user_ctx, uint16_t world, uint8
 	float macro = 120.0f * sinf(fx * 0.002454f) * cosf(fy * 0.002454f);
 	float meso  =  35.0f * sinf(fx * 0.019635f + 0.7f) * cosf(fy * 0.019635f - 0.4f);
 	float micro =  (level <= 2) ? (8.0f * sinf(fx * 0.098175f) * cosf(fy * 0.098175f)) : 0.0f;
-	float elev  = macro + meso + micro;
-	int32_t elev_q12_4 = (int32_t)(elev * 16.0f);
+	float field = macro + meso + micro;
+	int32_t field_q = (int32_t)(field * 16.0f);
 
-	out->val = (int16_t)elev_q12_4;
-	out->attr[0] = (elev_q12_4 < 0) ? 0 : ((elev_q12_4 > 100 * 16) ? 2 : 10);
+	out->val = (int16_t)field_q;
+	out->attr[0] = (field_q < 0) ? 0 : ((field_q > 100 * 16) ? 2 : 10);
 	out->attr[1] = out->attr[0];
 	out->attr[2] = 0;
-	out->attr[3] = (elev_q12_4 < 0) ? (uint8_t)(-elev_q12_4 > 255 * 16 ? 255 : (-elev_q12_4 >> 4)) : 0;
+	out->attr[3] = (field_q < 0) ? (uint8_t)(-field_q > 255 * 16 ? 255 : (-field_q >> 4)) : 0;
 	out->rgba = (out->attr[3] > 0) ? 0xFF003080u : 0xFF208020u;
-	out->flags = (out->attr[3] > 0) ? 1u : 0u;
+	out->flags = (out->attr[3] > 0) ? AR_NODE_FLAG_USER0 : 0u;
 }
 
-/* Mock procedural sampler: analytical sinusoidal elevation + water plane */
+/* Mock procedural sampler: analytical sinusoidal scalar field */
 static void mock_sampler(void *user_ctx, uint16_t world, uint8_t level,
                          int32_t wx, int32_t wy, ar_sample_t *out)
 {
@@ -43,15 +43,15 @@ static void mock_sampler(void *user_ctx, uint16_t world, uint8_t level,
 
 	float macro_h = 100.0f * sinf(fx * 0.0030679f) * cosf(fy * 0.0030679f);
 	float fine_h  =  20.0f * sinf(fx * 0.049087f)  * cosf(fy * 0.049087f);
-	float elev = macro_h + fine_h;
+	float field = macro_h + fine_h;
 
-	out->val = (int16_t)(elev * 16.0f);
-	out->attr[0] = (elev < 0.0f) ? 0 : ((elev > 60.0f) ? 2 : 10);
+	out->val = (int16_t)(field * 16.0f);
+	out->attr[0] = (field < 0.0f) ? 0 : ((field > 60.0f) ? 2 : 10);
 	out->attr[1] = out->attr[0];
 	out->attr[2] = 0;
-	out->attr[3] = (elev < 0.0f) ? (uint8_t)(-elev > 100.0f ? 100 : -elev) : 0;
+	out->attr[3] = (field < 0.0f) ? (uint8_t)(-field > 100.0f ? 100 : -field) : 0;
 	out->rgba = (out->attr[3] > 0) ? 0xFF003080u : 0xFF208020u;
-	out->flags = (out->attr[3] > 0) ? 1 : 0;
+	out->flags = (out->attr[3] > 0) ? AR_NODE_FLAG_USER0 : 0u;
 }
 
 /* Mock sparsity function: reports structures only near origin [-320..320, -256..256] */
@@ -98,6 +98,81 @@ static void level_dependent_sampler(void *user_ctx, uint16_t world, uint8_t leve
 	memset(out, 0, sizeof(*out));
 	out->val = (int16_t)(level * 100);
 	out->rgba = 0xFF208020u;
+}
+
+static float custom_square_interp_cb(float t)
+{
+	return t * t;
+}
+
+static void linear_ramp_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                                int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx;
+	(void)world;
+	(void)level;
+	memset(out, 0, sizeof(*out));
+	out->val = (int16_t)(wx * 10 + wy);
+	out->rgba = 0xFF4080C0u;
+}
+
+struct torus_test_ctx {
+	float R;
+	float r0;
+	float period_x;
+	float period_y;
+	float offset[3];
+};
+
+static void custom_torus_bounds_3d_cb(void *ctx, float ox, float oy, float w, float h,
+                                      float h_min, float h_max,
+                                      float out_min[3], float out_max[3],
+                                      float out_center[3],
+                                      float *out_span_w, float *out_span_h)
+{
+	const struct torus_test_ctx *tc = (const struct torus_test_ctx *)ctx;
+	float u_mid = ((ox + w * 0.5f) / tc->period_x) * 6.2831853f;
+	float v_mid = ((oy + h * 0.5f) / tc->period_y) * 6.2831853f;
+	float h_mid = (h_min + h_max) * 0.5f;
+	float tube_mid = tc->r0 + h_mid;
+	float rho_mid = tc->R + tube_mid * cosf(v_mid);
+	out_center[0] = rho_mid * sinf(u_mid) + tc->offset[0];
+	out_center[1] = -rho_mid * cosf(u_mid) + tc->offset[1];
+	out_center[2] = -tube_mid * sinf(v_mid) + tc->offset[2];
+
+	float bmin[3] = {  1e30f,  1e30f,  1e30f };
+	float bmax[3] = { -1e30f, -1e30f, -1e30f };
+	for (int iu = 0; iu <= 4; iu++) {
+		float u = ((ox + w * (float)iu * 0.25f) / tc->period_x) * 6.2831853f;
+		float su = sinf(u), cu = cosf(u);
+		for (int iv = 0; iv <= 4; iv++) {
+			float v = ((oy + h * (float)iv * 0.25f) / tc->period_y) * 6.2831853f;
+			float sv = sinf(v), cv = cosf(v);
+			for (int ih = 0; ih < 2; ih++) {
+				float tr = tc->r0 + (ih ? h_max : h_min);
+				float rho = tc->R + tr * cv;
+				float p[3] = {
+					rho * su + tc->offset[0],
+					-rho * cu + tc->offset[1],
+					-tr * sv + tc->offset[2]
+				};
+				for (int k = 0; k < 3; k++) {
+					if (p[k] < bmin[k]) bmin[k] = p[k];
+					if (p[k] > bmax[k]) bmax[k] = p[k];
+				}
+			}
+		}
+	}
+	/* Add chordal bulge safety margin for 4-segment sampling */
+	float du_step = (w / tc->period_x) * 6.2831853f * 0.25f;
+	float dv_step = (h / tc->period_y) * 6.2831853f * 0.25f;
+	float bulge = (tc->R + tc->r0) * du_step * du_step * 0.2f + tc->r0 * dv_step * dv_step * 0.2f;
+	for (int k = 0; k < 3; k++) {
+		out_min[k] = bmin[k] - bulge;
+		out_max[k] = bmax[k] + bulge;
+	}
+	*out_span_w = rho_mid * ((w / tc->period_x) * 6.2831853f);
+	*out_span_h = tube_mid * ((h / tc->period_y) * 6.2831853f);
 }
 
 #define TEST_GRID_DIM      32
@@ -374,8 +449,8 @@ int main(void)
 		ar_sample_t probe_sample;
 		bool probe_ok = ar_probe(simple_cs, 1, 0, 0, &probe_sample);
 		assert(probe_ok);
-		float probe_elev_f = ar_elevation_to_float(probe_sample.val);
-		int16_t roundtrip_q = ar_elevation_from_float(probe_elev_f);
+		float probe_val_f = ar_value_to_float(probe_sample.val);
+		int16_t roundtrip_q = ar_value_from_float(probe_val_f);
 		assert(abs(roundtrip_q - probe_sample.val) <= 1);
 
 		ar_clear(simple_cs);
@@ -405,9 +480,9 @@ int main(void)
 			                                        out_nodes[i]->level,
 			                                        out_nodes[i]->ox, out_nodes[i]->oy);
 			assert(found == out_nodes[i]);
-			assert(found->morton_key == out_nodes[i]->morton_key);
+			assert(ar_system_node_morton_key(morton_cs, found) == ar_system_node_morton_key(morton_cs, out_nodes[i]));
 
-			const ar_node_t *by_key = ar_system_find_by_key(morton_cs, out_nodes[i]->morton_key);
+			const ar_node_t *by_key = ar_system_find_by_key(morton_cs, ar_system_node_morton_key(morton_cs, out_nodes[i]));
 			assert(by_key == out_nodes[i]);
 		}
 
@@ -530,7 +605,8 @@ int main(void)
 
 		for (size_t i = 0; i < count_seven; i++) {
 			assert(items_seven[i].node != NULL);
-			assert((items_seven[i].node->active_view_mask & 1) != 0);
+			assert(ar_system_node_is_active_in_view(mv_cs, items_seven[i].node, 0));
+			assert((ar_system_node_active_views(mv_cs, items_seven[i].node) & 1u) != 0u);
 		}
 
 		ar_view_t view_lamina = {
@@ -548,13 +624,13 @@ int main(void)
 
 		for (size_t i = 0; i < count_lamina; i++) {
 			assert(items_lamina[i].node != NULL);
-			assert((items_lamina[i].node->active_view_mask & 2) != 0);
+			assert(ar_system_node_is_active_in_view(mv_cs, items_lamina[i].node, 1));
 			assert(items_lamina[i].node->level >= 2);
 		}
 
 		ar_begin_frame(mv_cs);
 		for (size_t i = 0; i < count_seven; i++) {
-			assert(items_seven[i].node->active_view_mask == 0);
+			assert(ar_system_node_active_views(mv_cs, items_seven[i].node) == 0u);
 		}
 
 		ar_sample_t probe_s;
@@ -897,7 +973,7 @@ int main(void)
 		size_t n0 = ar_system_query_matrix(iso_cs, 1, mvp, &opts0, v0_nodes, TEST_MAX_ACTIVE);
 		assert(n0 > 0);
 		assert(v0_nodes[0]->level >= 5);
-		assert((v0_nodes[0]->active_view_mask & (1u << 0)) != 0);
+		assert(ar_system_node_is_active_in_view(iso_cs, v0_nodes[0], 0));
 
 		/* View 1: 2D Orthographic Minimap (7x7 rooms = 1120x896 units in 224x224 px) */
 		size_t n1 = ar_eval_ortho(iso_cs, 1, 1, 0.0f, 0.0f, 1120.0f, 896.0f, 224.0f, 224.0f);
@@ -1001,12 +1077,301 @@ int main(void)
 
 	/* 21. Multi-scale LOD texel span helper (ar_level_texel_span) */
 	{
-		float span0 = ar_level_texel_span(16384, 32, 0);
-		float span2 = ar_level_texel_span(16384, 32, 2);
-		assert(fabsf(span0 - 512.0f) < 1e-4f);
-		assert(fabsf(span2 - 128.0f) < 1e-4f);
-		assert(ar_level_texel_span(16384, 0, 0) == 0.0f);
+		float span0 = ar_level_texel_span(160, 32, 0);
+		float span2 = ar_level_texel_span(160, 32, 2);
+		assert(fabsf(span0 - 5.0f) < 1e-4f);
+		assert(fabsf(span2 - 20.0f) < 1e-4f);
+		assert(span2 > span0);
+		assert(ar_level_texel_span(160, 0, 0) == 0.0f);
+		assert(ar_level_texel_span(0, 32, 0) == 0.0f);
 		printf("  [PASS] ar_level_texel_span verified (L0=%.1f, L2=%.1f)\n", span0, span2);
+	}
+
+	/* 22. Configurable value_scale, view->yaw rotation, AR_NODE_FLAG_SPARSE masking, and active accessors */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.grid_dim = 16;
+		cfg.pool_capacity = 64;
+		cfg.max_active = 32;
+		cfg.max_levels = 8;
+		cfg.value_scale = 32.0f;
+		cfg.max_root_cells = 16;
+		cfg.probe_ancestor_cap = 6;
+		cfg.sampler = mock_sampler;
+		cfg.sparsity = mock_sparsity;
+
+		ar_system_t *cfg_cs = ar_system_create_ex(&cfg);
+		assert(cfg_cs != NULL);
+
+		assert(fabsf(ar_value_to_float_ex(320, 32.0f) - 10.0f) < 1e-4f);
+		assert(ar_value_from_float_ex(10.0f, 32.0f) == 320);
+
+		ar_view_t view_north = {
+			.cam_x = 0.0f, .cam_y = 0.0f, .cam_z = 0.0f,
+			.pitch = 0.8f, .yaw = 0.0f, .fov = 0.785398f,
+			.zoom = 1.0f, .viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.eff_cam_dist = 400.0f
+		};
+		ar_view_t view_east = view_north;
+		view_east.yaw = 1.5707963f;
+
+		const ar_node_t *nodes_n[32];
+		const ar_node_t *nodes_e[32];
+		size_t cn = ar_system_update(cfg_cs, 1, &view_north, nodes_n, 32);
+		assert(cn > 0);
+		assert(ar_system_get_active_count(cfg_cs) == cn);
+		assert(ar_system_get_active_node(cfg_cs, 0) == nodes_n[0]);
+
+		size_t ce = ar_system_update(cfg_cs, 1, &view_east, nodes_e, 32);
+		assert(ce > 0);
+
+		/* Populate a coarse node at level 5 and verify ar_system_probe_ex finds it when max_ancestor_levels >= 5 */
+		const ar_node_t *n_l5 = ar_system_ensure(cfg_cs, 2, 5, 0, 0);
+		assert(n_l5 != NULL);
+		assert(ar_node_is_sparse(n_l5));
+		ar_sample_t s_p5;
+		assert(ar_system_probe_ex(cfg_cs, 2, 32, 32, 5, &s_p5));
+
+		ar_system_destroy(cfg_cs);
+		printf("  [PASS] Configurable value_scale, yaw rotation, AR_NODE_FLAG_SPARSE, and probe_ex verified\n");
+	}
+
+	/* 23. Handle-driven value_scale & texel_span helpers, probe interpolation modes, 32-view bitmask, and ar_eval_ortho_ex */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.grid_dim = 16;
+		cfg.pool_capacity = 32;
+		cfg.max_active = 16;
+		cfg.max_levels = 8;
+		cfg.value_scale = 64.0f;
+		cfg.map_capacity = 128;
+		cfg.interp_mode = AR_INTERP_LINEAR;
+		cfg.default_pitch = 0.85f;
+		cfg.default_cam_dist = 500.0f;
+		cfg.default_topdown_dist = 800.0f;
+		cfg.default_viewport_w = 1024.0f;
+		cfg.default_viewport_h = 768.0f;
+		cfg.sag_radius = 25000.0f;
+		cfg.sag_tangent_slope = 3.0f;
+		cfg.split_hysteresis = 0.10f;
+		cfg.sampler = linear_ramp_sampler;
+
+		ar_system_t *h_sys = ar_system_create_ex(&cfg);
+		assert(h_sys != NULL);
+
+		/* Handle-driven value_scale and texel_span */
+		assert(fabsf(ar_system_get_value_scale(h_sys) - 64.0f) < 1e-5f);
+		assert(fabsf(ar_system_value_to_float(h_sys, 640) - 10.0f) < 1e-5f);
+		assert(ar_system_value_from_float(h_sys, 10.0f) == 640);
+		assert(fabsf(ar_system_level_texel_span(h_sys, 0) - 10.0f) < 1e-5f);
+		assert(fabsf(ar_system_level_texel_span(h_sys, 2) - 40.0f) < 1e-5f);
+
+		/* Populate L0 node [0..160, 0..128] (each cell is 10x8 units) and verify exact linear interpolation at midpoint (5, 0) */
+		const ar_node_t *n0 = ar_system_ensure(h_sys, 1, 0, 0, 0);
+		assert(n0 != NULL);
+		ar_sample_t s_lin;
+		assert(ar_system_probe(h_sys, 1, 2, 0, &s_lin));
+		/* Under AR_INTERP_LINEAR, u = 2/10 = 0.2 -> val = 0*(0.8) + 100*(0.2) = 20 */
+		assert(s_lin.val == 20);
+
+		/* Test custom interpolation callback */
+		cfg.interp_fn = custom_square_interp_cb;
+		ar_system_t *fn_sys = ar_system_create_ex(&cfg);
+		assert(fn_sys != NULL);
+		(void)ar_system_ensure(fn_sys, 1, 0, 0, 0);
+		ar_sample_t s_sq;
+		assert(ar_system_probe(fn_sys, 1, 5, 0, &s_sq));
+		/* Under u^2 at u = 0.5 -> weight = 0.25 -> val = 100 * 0.25 = 25 */
+		assert(s_sq.val == 25);
+		ar_system_destroy(fn_sys);
+
+		/* Test 32-view active_view_mask (e.g. view_id = 29) and ar_eval_ortho_ex */
+		ar_ortho_opts_t o_opts = {
+			.center_x = 0.0f, .center_y = 0.0f,
+			.world_w = 640.0f, .world_h = 512.0f,
+			.viewport_w = 320.0f, .viewport_h = 256.0f,
+			.target_quad_px = 1.5f,
+			.max_root_cells = 16,
+			.min_level = 1, .max_level = 3
+		};
+		size_t no = ar_eval_ortho_ex(h_sys, 29, 1, &o_opts);
+		assert(no > 0);
+		const ar_node_t *an0 = ar_system_get_active_node(h_sys, 0);
+		assert(an0 != NULL);
+		assert(ar_system_node_is_active_in_view(h_sys, an0, 29));
+		assert((ar_system_node_active_views(h_sys, an0) & (1u << 29)) != 0u);
+		assert(ar_system_node_morton_key(h_sys, an0) != 0u);
+		assert(an0->level >= 1 && an0->level <= 3);
+
+		ar_sample_t sv29;
+		assert(ar_probe_view(h_sys, 29, 1, 10, 10, &sv29));
+
+		ar_system_destroy(h_sys);
+		printf("  [PASS] Handle-driven value_scale/texel_span, probe interp_mode/interp_fn, 32-view mask, and ar_eval_ortho_ex verified\n");
+	}
+
+	/* 24. Unit-scale top-down camera distance (< 100.0f), ray window cull options, and attribute interpolation */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 8;
+		cfg.base_h = 8;
+		cfg.grid_dim = 8;
+		cfg.pool_capacity = 32;
+		cfg.max_active = 16;
+		cfg.max_levels = 6;
+		cfg.value_scale = 1.0f;
+		cfg.attr_count = 4;
+		cfg.attr_interp_mode = AR_INTERP_LINEAR;
+		cfg.interpolate_attrs = true;
+		cfg.sampler = linear_ramp_sampler;
+
+		ar_system_t *u_sys = ar_system_create_ex(&cfg);
+		assert(u_sys != NULL);
+
+		/* Top-down perspective view with small eff_cam_dist = 10.0f (must NOT jump to default_topdown_dist) */
+		ar_view_t td_view = {
+			.cam_x = 0.0f, .cam_y = 0.0f, .cam_z = 0.0f,
+			.pitch = AR_PITCH_TOP_DOWN, .yaw = 0.0f, .fov = 0.785398f,
+			.zoom = 1.0f, .viewport_w = 64.0f, .viewport_h = 64.0f,
+			.eff_cam_dist = 10.0f
+		};
+		const ar_node_t *td_nodes[16];
+		size_t n_td = ar_system_update(u_sys, 1, &td_view, td_nodes, 16);
+		assert(n_td > 0);
+		assert(td_nodes[0]->level <= 2);
+
+		/* Verify attribute interpolation & attr_count masking (channels 0..3 interpolated, 4..7 zeroed) */
+		const ar_node_t *un0 = ar_system_ensure(u_sys, 1, 0, 0, 0);
+		assert(un0 != NULL);
+		/* linear_ramp_sampler sets attr[0] = (wx + wy) & 0xFF; at (0,0)->0, (1,0)->1; wait: L0 has w=8, grid_dim=8, step=1 */
+		/* Let's ensure L2 where w=32, grid_dim=8, cell_step=4: at wx=0 attr[0]=0, at wx=4 attr[0]=4; at wx=2 -> attr[0]=2 */
+		const ar_node_t *un2 = ar_system_ensure(u_sys, 2, 2, 0, 0);
+		assert(un2 != NULL);
+		ar_sample_t sa;
+		memset(&sa, 0xFF, sizeof(sa));
+		assert(ar_system_probe(u_sys, 2, 2, 0, &sa));
+		assert(sa.attr[4] == 0 && sa.attr[5] == 0 && sa.attr[6] == 0 && sa.attr[7] == 0);
+
+		/* Verify configurable ray window options in ar_cull_opts_t */
+		float mvp[16];
+		ar_mat4_ortho(mvp, -16.0f, 16.0f, -16.0f, 16.0f, -10.0f, 10.0f);
+		ar_cull_opts_t copts;
+		memset(&copts, 0, sizeof(copts));
+		copts.z_min = -4.0f;
+		copts.z_max = 4.0f;
+		copts.viewport_w = 64.0f;
+		copts.viewport_h = 64.0f;
+		copts.target_quad_px = 2.0f;
+		copts.ortho_ray_t_min = -0.5f;
+		copts.unit_ray_t_max = 1.5f;
+		copts.far_mid_ray_t_max = 500000.0f;
+		copts.fallback_persp_aspect = 1.33f;
+		copts.behind_cam_clip_w = 0.5f;
+		copts.behind_cam_screen_mult = 3.0f;
+		size_t n_cull = ar_system_query_matrix(u_sys, 1, mvp, &copts, td_nodes, 16);
+		assert(n_cull > 0);
+
+		ar_system_destroy(u_sys);
+		printf("  [PASS] Unit-scale top-down camera distance, ray window cull opts, and attribute interpolation verified\n");
+	}
+
+	/* 25. 3D Manifold Bounding Box Callback (bounds_3d_fn) for Toroidal / Orbital Bodies */
+	{
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.grid_dim = 16;
+		cfg.pool_capacity = 256;
+		cfg.max_active = 128;
+		cfg.max_levels = 15;
+		cfg.period_x = 160 * 65536;
+		cfg.period_y = 128 * 65536;
+		cfg.max_root_cells = 16;
+		cfg.sampler = mock_sampler;
+
+		ar_system_t *t_sys = ar_system_create_ex(&cfg);
+		assert(t_sys != NULL);
+
+		/* Camera positioned relative to surface point at u=0, v=0 -> (0, -(R+r0), 0)
+		 * Shift offset by (0, +(R+r0), 0) so surface origin is at (0, 0, 0) */
+		struct torus_test_ctx planet_ctx = {
+			.R = 2000000.0f,
+			.r0 = 1335000.0f,
+			.period_x = (float)(160 * 65536),
+			.period_y = (float)(128 * 65536),
+			.offset = { 0.0f, 3335000.0f, 0.0f }
+		};
+
+		float eye[3] = { 0.0f, -1500.0f, 800.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, 0.0f, 1.0f };
+		float mv[16], proj[16], mvp[16];
+		ar_mat4_lookat(mv, eye, target, up);
+		ar_mat4_perspective(proj, 0.785398f, 16.0f / 9.0f, 10.0f, 30000000.0f);
+		ar_mat4_multiply(mvp, proj, mv);
+
+		ar_cull_opts_t p_opts;
+		memset(&p_opts, 0, sizeof(p_opts));
+		p_opts.z_min = -500.0f;
+		p_opts.z_max = 500.0f;
+		p_opts.viewport_w = 1280.0f;
+		p_opts.viewport_h = 720.0f;
+		p_opts.target_quad_px = 4.0f;
+		p_opts.min_level = 0;
+		p_opts.max_level = 14;
+		p_opts.bounds_3d_fn = custom_torus_bounds_3d_cb;
+		p_opts.bounds_ctx = &planet_ctx;
+
+		const ar_node_t *p_nodes[128];
+		size_t np = ar_system_query_matrix(t_sys, 1, mvp, &p_opts, p_nodes, 128);
+		assert(np > 0);
+		/* Nearest node at origin (0,0) must have subdivided to fine LOD (< 5) */
+		assert(p_nodes[0]->level <= 4);
+		/* Opposite side of the torus (u ~ pi, y_3d ~ +6.67M behind or far) should not be subdivided to L0 */
+		bool has_fine = false;
+		for (size_t i = 0; i < np; i++) {
+			if (p_nodes[i]->level <= 3) has_fine = true;
+		}
+		assert(has_fine);
+
+		/* Distant Moon in front of camera along look ray (0, +1500, -800) at (0, +14000000, -7000000):
+		 * Query WITHOUT forcing min_level=14; 3D screen-space projection must pick coarse levels automatically */
+		struct torus_test_ctx moon_vis_ctx = {
+			.R = 800000.0f,
+			.r0 = 500000.0f,
+			.period_x = (float)(160 * 65536),
+			.period_y = (float)(128 * 65536),
+			.offset = { 0.0f, 14000000.0f, -7000000.0f }
+		};
+		p_opts.bounds_ctx = &moon_vis_ctx;
+		p_opts.view_id = 1;
+		const ar_node_t *m_nodes[128];
+		size_t nm_vis = ar_system_query_matrix(t_sys, 2, mvp, &p_opts, m_nodes, 128);
+		assert(nm_vis > 0);
+		for (size_t i = 0; i < nm_vis; i++) {
+			assert(m_nodes[i]->level >= 9);
+		}
+
+		/* Distant Moon behind the camera at (0, -14000000, +7000000): must be 100% frustum-culled (0 nodes) */
+		struct torus_test_ctx moon_behind_ctx = moon_vis_ctx;
+		moon_behind_ctx.offset[1] = -14000000.0f;
+		moon_behind_ctx.offset[2] = 7000000.0f;
+		p_opts.bounds_ctx = &moon_behind_ctx;
+		p_opts.view_id = 2;
+		size_t nm_behind = ar_system_query_matrix(t_sys, 2, mvp, &p_opts, m_nodes, 128);
+		assert(nm_behind == 0);
+
+		ar_system_destroy(t_sys);
+		printf("  [PASS] 3D manifold bounds_3d_fn frustum culling & screen-space LOD verified (planet=%zu, moon_vis=%zu, moon_behind=%zu)\n",
+		       np, nm_vis, nm_behind);
 	}
 
 	ar_system_destroy(cs);

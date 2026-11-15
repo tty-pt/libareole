@@ -23,6 +23,7 @@
 #define AR_UNIFORM_MVP           "uMVP"
 #define AR_UNIFORM_FOCAL_CENTER  "uFocalCenter"
 #define AR_UNIFORM_CURVE_RADIUS  "uCurveRadius"
+#define AR_UNIFORM_SAG_SLOPE     "uSagTangentSlope"
 
 /* Uniform buffer representation in C */
 typedef struct {
@@ -31,7 +32,10 @@ typedef struct {
 	float mvp[16];         /* uMVP: Column-major 4x4 matrix */
 	float focal_center[2]; /* uFocalCenter: Camera focal center (tx, ty) */
 	float curve_radius;    /* uCurveRadius: Spherical curvature radius (0 = flat) */
-	float padding;         /* Alignment */
+	union {
+		float sag_tangent_slope; /* uSagTangentSlope: Linear tangent slope beyond curve_radius (0 = default 2.0f) */
+		float padding;           /* Legacy alignment alias */
+	};
 } ar_glsl_uniforms_t;
 
 /* GLSL ES 3.0 Shader Source Functions */
@@ -39,13 +43,17 @@ typedef struct {
 	"vec2 ar_uv_to_world(vec2 uv, vec2 origin, vec2 span) {\n" \
 	"    return origin + uv * span;\n" \
 	"}\n" \
-	"vec3 ar_apply_spherical_sag(vec2 world_pos, float base_z, vec2 focal_center, float curve_radius) {\n" \
+	"vec3 ar_apply_spherical_sag_ex(vec2 world_pos, float base_z, vec2 focal_center, float curve_radius, float sag_slope) {\n" \
 	"    if (curve_radius <= 0.0) return vec3(world_pos.x, world_pos.y, base_z);\n" \
+	"    float slope = (sag_slope > 0.0) ? sag_slope : 2.0;\n" \
 	"    vec2 dFocal = world_pos - focal_center;\n" \
 	"    float r2 = dot(dFocal, dFocal);\n" \
 	"    float r = sqrt(r2);\n" \
-	"    float curveSag = (r < curve_radius) ? (curve_radius - sqrt(max(1.0, curve_radius * curve_radius - r2))) : (curve_radius + (r - curve_radius) * 2.0);\n" \
+	"    float curveSag = (r < curve_radius) ? (curve_radius - sqrt(max(1.0, curve_radius * curve_radius - r2))) : (curve_radius + (r - curve_radius) * slope);\n" \
 	"    return vec3(world_pos.x, world_pos.y, base_z - curveSag);\n" \
+	"}\n" \
+	"vec3 ar_apply_spherical_sag(vec2 world_pos, float base_z, vec2 focal_center, float curve_radius) {\n" \
+	"    return ar_apply_spherical_sag_ex(world_pos, base_z, focal_center, curve_radius, 2.0);\n" \
 	"}\n" \
 	"vec4 ar_project(vec3 curved_pos, mat4 mvp) {\n" \
 	"    return mvp * vec4(curved_pos, 1.0);\n" \
@@ -63,9 +71,9 @@ static inline void ar_glsl_ref_uv_to_world(const float uv[2], const float origin
 	out_world[1] = origin[1] + uv[1] * span[1];
 }
 
-static inline void ar_glsl_ref_apply_spherical_sag(const float world_pos[2], float base_z,
-                                                   const float focal_center[2], float curve_radius,
-                                                   float out_curved[3])
+static inline void ar_glsl_ref_apply_spherical_sag_ex(const float world_pos[2], float base_z,
+                                                      const float focal_center[2], float curve_radius,
+                                                      float sag_slope, float out_curved[3])
 {
 	if (curve_radius <= 0.0f) {
 		out_curved[0] = world_pos[0];
@@ -73,6 +81,7 @@ static inline void ar_glsl_ref_apply_spherical_sag(const float world_pos[2], flo
 		out_curved[2] = base_z;
 		return;
 	}
+	float slope = (sag_slope > 0.0f) ? sag_slope : 2.0f;
 	float dx = world_pos[0] - focal_center[0];
 	float dy = world_pos[1] - focal_center[1];
 	float r2 = dx * dx + dy * dy;
@@ -83,11 +92,18 @@ static inline void ar_glsl_ref_apply_spherical_sag(const float world_pos[2], flo
 		if (diff < 1.0f) diff = 1.0f;
 		curveSag = curve_radius - sqrtf(diff);
 	} else {
-		curveSag = curve_radius + (r - curve_radius) * 2.0f;
+		curveSag = curve_radius + (r - curve_radius) * slope;
 	}
 	out_curved[0] = world_pos[0];
 	out_curved[1] = world_pos[1];
 	out_curved[2] = base_z - curveSag;
+}
+
+static inline void ar_glsl_ref_apply_spherical_sag(const float world_pos[2], float base_z,
+                                                   const float focal_center[2], float curve_radius,
+                                                   float out_curved[3])
+{
+	ar_glsl_ref_apply_spherical_sag_ex(world_pos, base_z, focal_center, curve_radius, 2.0f, out_curved);
 }
 
 static inline void ar_glsl_ref_project(const float curved_pos[3], const float mvp[16], float out_clip[4])
@@ -97,6 +113,35 @@ static inline void ar_glsl_ref_project(const float curved_pos[3], const float mv
 	out_clip[1] = mvp[1] * x + mvp[5] * y + mvp[9]  * z + mvp[13] * w;
 	out_clip[2] = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14] * w;
 	out_clip[3] = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15] * w;
+}
+
+/**
+ * Struct-driven full vertex pipeline evaluation from `ar_glsl_uniforms_t *`.
+ * Evaluates UV -> world_pos -> curved_pos (with u->curve_radius & u->sag_tangent_slope) -> clip_pos (with u->mvp).
+ */
+static inline void ar_glsl_ref_eval_vertex(const ar_glsl_uniforms_t *u,
+                                           const float uv[2], float base_z,
+                                           float out_world[2], float out_curved[3], float out_clip[4])
+{
+	if (!u || !uv)
+		return;
+	float wpos[2];
+	float cpos[3];
+	ar_glsl_ref_uv_to_world(uv, u->origin, u->span, wpos);
+	ar_glsl_ref_apply_spherical_sag_ex(wpos, base_z, u->focal_center, u->curve_radius,
+	                                   u->sag_tangent_slope, cpos);
+	if (out_world) {
+		out_world[0] = wpos[0];
+		out_world[1] = wpos[1];
+	}
+	if (out_curved) {
+		out_curved[0] = cpos[0];
+		out_curved[1] = cpos[1];
+		out_curved[2] = cpos[2];
+	}
+	if (out_clip) {
+		ar_glsl_ref_project(cpos, u->mvp, out_clip);
+	}
 }
 
 #endif /* TTYPT_AREOLE_GLSL_H */
