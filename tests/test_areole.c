@@ -1374,7 +1374,97 @@ int main(void)
 		       np, nm_vis, nm_behind);
 	}
 
+	/* Test 19: Universal Projected Solid-Angle Law & Scale-Ordered Spatial Cell Index */
+	{
+		/* Verify ar_level_texel_span_q16 matches ar_level_texel_span * 65536 */
+		for (uint8_t lvl = 0; lvl <= 12; lvl++) {
+			float sp_f = ar_level_texel_span(160, 48, lvl);
+			int32_t sp_q16 = ar_level_texel_span_q16(160, 48, lvl);
+			assert(fabsf(sp_f - ((float)sp_q16 / 65536.0f)) < 1e-3f);
+		}
+
+		ar_solid_angle_t sa;
+		ar_solid_angle_init(&sa, 220.0f, 512.0f, 512.0f, 220.0f, 1.25f, 3.0f);
+		assert(fabsf(sa.focal_proj - 220.0f) < 1e-5f);
+
+		/* Verify duality: ar_solid_angle_min_extent(ar_solid_angle_max_dist(D)) == D */
+		float extents[] = { 10.0f, 18.0f, 32.0f, 64.0f, 96.0f };
+		for (size_t i = 0; i < sizeof(extents) / sizeof(extents[0]); i++) {
+			float r_max = ar_solid_angle_max_dist(&sa, extents[i]);
+			float d_min = ar_solid_angle_min_extent(&sa, r_max);
+			assert(fabsf(d_min - extents[i]) < 1e-3f);
+			/* At r_max, projected size is exactly s_min (1.25 px) -> alpha == 0 */
+			assert(ar_solid_angle_alpha(&sa, extents[i], r_max + 1.0f) == 0.0f);
+			/* At r_full = D * 220 / 3.0, projected size is 3.0 px -> alpha == 1 */
+			float r_full = (extents[i] * sa.focal_proj) / sa.full_px;
+			assert(fabsf(ar_solid_angle_alpha(&sa, extents[i], r_full) - 1.0f) < 1e-4f);
+		}
+
+		/* Verify scale-descending + painter-tiebreak sorting and prefix culling */
+		struct test_sprite {
+			float x, y, w, h;
+		};
+		struct test_sprite items[6] = {
+			{ 100.0f, 200.0f, 10.0f, 12.0f }, /* small stone (ext 12) */
+			{  80.0f, 300.0f, 48.0f, 64.0f }, /* giant tree South (ext 64, y=300) */
+			{  50.0f,  90.0f, 18.0f, 22.0f }, /* herb North (ext 22, y=90) */
+			{  40.0f, 120.0f, 52.0f, 64.0f }, /* giant tree North (ext 64, y=120) */
+			{  60.0f, 150.0f, 28.0f, 34.0f }, /* bush (ext 34) */
+			{  90.0f,  90.0f, 20.0f, 22.0f }  /* herb North-East (ext 22, y=90, x=90) */
+		};
+		/* Inline key callback via static helper block */
+		void (*key_cb)(const void *, float *, float *, float *) = NULL;
+		/* Use explicit key extractor */
+		{
+			/* Sort using ar_scale_painter_cmp directly via a small wrapper */
+			extern void test_sprite_key_fn(const void *elem, float *out_ext, float *out_x, float *out_y);
+			key_cb = test_sprite_key_fn;
+		}
+		ar_scale_cell_t cell;
+		ar_scale_cell_build(&cell, 0, items, 6, sizeof(items[0]), key_cb);
+		assert(cell.count == 6);
+		assert(fabsf(cell.max_extent - 64.0f) < 1e-5f);
+		assert(fabsf(cell.min_extent - 12.0f) < 1e-5f);
+
+		/* Verify primary order is extent descending: 64, 64, 34, 22, 22, 12 */
+		assert(fmaxf(items[0].w, items[0].h) == 64.0f);
+		assert(fmaxf(items[1].w, items[1].h) == 64.0f);
+		/* Within extent=64, North-to-South painter order (y=120 before y=300) */
+		assert(items[0].y == 120.0f && items[1].y == 300.0f);
+		assert(fmaxf(items[2].w, items[2].h) == 34.0f);
+		assert(fmaxf(items[3].w, items[3].h) == 22.0f);
+		assert(fmaxf(items[4].w, items[4].h) == 22.0f);
+		/* Within extent=22 and y=90, x=50 before x=90 */
+		assert(items[3].x == 50.0f && items[4].x == 90.0f);
+		assert(fmaxf(items[5].w, items[5].h) == 12.0f);
+
+		/* At distance r = 4500 wu, cutoff D_min(4500) = 1.25 * 4500 / 220 = 25.56 wu:
+		 * Cell is visible (max_extent 64 >= 25.56), and prefix scan stops after index 2 (extents 64, 64, 34)! */
+		float cutoff = 0.0f;
+		assert(ar_scale_cell_cull(&cell, &sa, 4500.0f, 500.0f, &cutoff) == true);
+		uint16_t vis_prefix = 0;
+		for (uint16_t i = 0; i < cell.count; i++) {
+			float ext = fmaxf(items[i].w, items[i].h);
+			if (ext < cutoff)
+				break;
+			vis_prefix++;
+		}
+		assert(vis_prefix == 3); /* Only the two 64-wu trees and 34-wu bush are visited; herbs & stone are skipped! */
+
+		/* Beyond r = 12000 wu (r_near = 11500 -> D_min = 65.34 > max_extent 64): O(1) cell cull returns false! */
+		assert(ar_scale_cell_cull(&cell, &sa, 12000.0f, 500.0f, &cutoff) == false);
+		printf("  [PASS] Universal solid-angle law & scale-ordered cell prefix culling verified\n");
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;
+}
+
+void test_sprite_key_fn(const void *elem, float *out_ext, float *out_x, float *out_y)
+{
+	const float *f = (const float *)elem; /* x, y, w, h */
+	*out_x = f[0];
+	*out_y = f[1];
+	*out_ext = (f[2] > f[3]) ? f[2] : f[3];
 }

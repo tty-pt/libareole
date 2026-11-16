@@ -27,6 +27,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+#include <math.h>
 #include <ttypt/islet_quad.h>
 
 #ifdef __cplusplus
@@ -469,6 +471,179 @@ static inline float ar_level_texel_span(int32_t base_span, uint16_t grid_dim, ui
 		return 0.0f;
 	float chunk_span = (float)((int64_t)base_span << level);
 	return chunk_span / (float)grid_dim;
+}
+
+/**
+ * Compute the Q16.16 fixed-point world-space sampling step (texel span) for a quadtree LOD level.
+ */
+static inline int32_t ar_level_texel_span_q16(int32_t base_span, uint16_t grid_dim, uint8_t level)
+{
+	if (grid_dim == 0 || base_span <= 0 || level >= 31)
+		return 0;
+	int64_t chunk_span_q16 = ((int64_t)base_span << (level + 16));
+	int64_t step_q16 = chunk_span_q16 / (int64_t)grid_dim;
+	if (step_q16 > 0x7FFFFFFFLL)
+		return 0x7FFFFFFF;
+	return (int32_t)step_q16;
+}
+
+/* ========================================================================= */
+/* Universal Projected Solid-Angle Visibility & Scale-Ordered Spatial Cells  */
+/* ========================================================================= */
+
+/**
+ * Frame-level camera projection parameters for solid-angle extent culling.
+ * Maps world-space bounding extent D = max(w, h) at 3D distance r to projected
+ * screen-space pixel size s_px(D, r) = (D * focal_proj) / max(r, min_dist).
+ */
+typedef struct {
+	float focal_proj; /* Pixels per world unit at unit distance (f_proj) */
+	float min_px;     /* Minimum projected pixel extent before cutoff (s_min) */
+	float full_px;    /* Projected pixel extent for 100% opacity (s_full) */
+	float min_dist;   /* Effective minimum camera distance clamp (r_min) */
+} ar_solid_angle_t;
+
+static inline void ar_solid_angle_init(ar_solid_angle_t *sa,
+                                       float ref_cam_dist,
+                                       float viewport_h, float ref_viewport_h,
+                                       float eff_cam_dist,
+                                       float min_px, float full_px)
+{
+	if (!sa) return;
+	float vp_scale = (viewport_h > 0.0f && ref_viewport_h > 0.0f) ? (viewport_h / ref_viewport_h) : 1.0f;
+	sa->focal_proj = (ref_cam_dist > 0.0f ? ref_cam_dist : 220.0f) * vp_scale;
+	sa->min_px = (min_px > 0.0f) ? min_px : 1.25f;
+	sa->full_px = (full_px > sa->min_px) ? full_px : (sa->min_px + 1.75f);
+	sa->min_dist = (eff_cam_dist > 1.0f) ? eff_cam_dist : 1.0f;
+}
+
+static inline float ar_solid_angle_dist_2d(const ar_solid_angle_t *sa, float dx, float dy)
+{
+	float r_min = sa ? sa->min_dist : 1.0f;
+	return sqrtf(dx * dx + dy * dy + r_min * r_min);
+}
+
+static inline float ar_solid_angle_px(const ar_solid_angle_t *sa, float extent, float dist)
+{
+	if (!sa || extent <= 0.0f) return 0.0f;
+	float r = (dist > sa->min_dist) ? dist : sa->min_dist;
+	return (extent * sa->focal_proj) / r;
+}
+
+static inline float ar_solid_angle_min_extent(const ar_solid_angle_t *sa, float dist)
+{
+	if (!sa || sa->focal_proj <= 0.0f) return 0.0f;
+	float r = (dist > sa->min_dist) ? dist : sa->min_dist;
+	return (sa->min_px * r) / sa->focal_proj;
+}
+
+static inline float ar_solid_angle_max_dist(const ar_solid_angle_t *sa, float extent)
+{
+	if (!sa || sa->min_px <= 0.0f || extent <= 0.0f) return 0.0f;
+	return (extent * sa->focal_proj) / sa->min_px;
+}
+
+static inline float ar_solid_angle_alpha(const ar_solid_angle_t *sa, float extent, float dist)
+{
+	float px = ar_solid_angle_px(sa, extent, dist);
+	if (!sa || px <= sa->min_px) return 0.0f;
+	if (px >= sa->full_px) return 1.0f;
+	float t = (px - sa->min_px) / (sa->full_px - sa->min_px);
+	return t * t * (3.0f - 2.0f * t);
+}
+
+/**
+ * Spatial cell summary header for scale-ordered prefix traversal (zero blind replay).
+ * Elements in the cell's arena slice [offset .. offset + count - 1] are sorted by
+ * quantized extent descending (D_0 >= D_1 >= ... >= D_{count-1}), with North-to-South
+ * painter tie-break (y ascending, then x ascending) within each scale class.
+ */
+typedef struct {
+	uint32_t offset;     /* Start index in backing arena */
+	uint16_t count;      /* Total elements in cell */
+	float    max_extent; /* Largest element extent D_0 in cell */
+	float    min_extent; /* Smallest element extent D_{count-1} in cell */
+} ar_scale_cell_t;
+
+typedef void (*ar_scale_elem_key_fn)(const void *elem, float *out_extent, float *out_x, float *out_y);
+
+static inline int ar_scale_painter_cmp(float ext_a, float xa, float ya,
+                                       float ext_b, float xb, float yb)
+{
+	int qa = (int)ext_a;
+	int qb = (int)ext_b;
+	if (qa != qb)
+		return (qa > qb) ? -1 : 1; /* Descending scale order */
+	if (ya != yb)
+		return (ya < yb) ? -1 : 1; /* North-to-South painter order (y ascending) */
+	if (xa != xb)
+		return (xa < xb) ? -1 : 1;
+	return 0;
+}
+
+static inline void ar_scale_cell_build(ar_scale_cell_t *cell, uint32_t offset,
+                                       void *elems, uint16_t count, size_t elem_size,
+                                       ar_scale_elem_key_fn key_fn)
+{
+	if (!cell) return;
+	cell->offset = offset;
+	cell->count = count;
+	cell->max_extent = 0.0f;
+	cell->min_extent = 0.0f;
+	if (!elems || count == 0 || elem_size == 0 || !key_fn)
+		return;
+
+	uint8_t *base = (uint8_t *)elems;
+	uint8_t tmp[256];
+	if (count > 1 && elem_size <= sizeof(tmp)) {
+		/* Shell sort: O(N log N) in-place with zero heap allocation */
+		for (uint16_t gap = count >> 1; gap > 0; gap >>= 1) {
+			for (uint16_t i = gap; i < count; i++) {
+				memcpy(tmp, base + (size_t)i * elem_size, elem_size);
+				float ext_i = 0.0f, xi = 0.0f, yi = 0.0f;
+				key_fn(tmp, &ext_i, &xi, &yi);
+				uint16_t j = i;
+				while (j >= gap) {
+					const void *prev = base + (size_t)(j - gap) * elem_size;
+					float ext_p = 0.0f, xp = 0.0f, yp = 0.0f;
+					key_fn(prev, &ext_p, &xp, &yp);
+					if (ar_scale_painter_cmp(ext_p, xp, yp, ext_i, xi, yi) <= 0)
+						break;
+					memcpy(base + (size_t)j * elem_size, prev, elem_size);
+					j -= gap;
+				}
+				memcpy(base + (size_t)j * elem_size, tmp, elem_size);
+			}
+		}
+	}
+
+	float max_e = 0.0f, min_e = 1e30f;
+	for (uint16_t i = 0; i < count; i++) {
+		float e = 0.0f, x = 0.0f, y = 0.0f;
+		key_fn(base + (size_t)i * elem_size, &e, &x, &y);
+		if (e > max_e) max_e = e;
+		if (e < min_e) min_e = e;
+	}
+	cell->max_extent = max_e;
+	cell->min_extent = (min_e <= max_e) ? min_e : 0.0f;
+}
+
+static inline bool ar_scale_cell_cull(const ar_scale_cell_t *cell,
+                                      const ar_solid_angle_t *sa,
+                                      float cell_dist, float cell_radius,
+                                      float *out_cutoff_extent)
+{
+	if (!cell || cell->count == 0 || !sa)
+		return false;
+	float r_near = cell_dist - cell_radius;
+	if (r_near < sa->min_dist)
+		r_near = sa->min_dist;
+	float near_cutoff = ar_solid_angle_min_extent(sa, r_near);
+	if (cell->max_extent < near_cutoff)
+		return false;
+	if (out_cutoff_extent)
+		*out_cutoff_extent = ar_solid_angle_min_extent(sa, cell_dist);
+	return true;
 }
 
 /* Statistics inspection for diagnostics and unit tests */
