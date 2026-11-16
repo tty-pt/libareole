@@ -13,14 +13,16 @@
     "LICENSE"
   ],
   "scripts": {
+    "build:native": "mkdir -p build/Release && gcc -O3 -fPIC -shared -I/usr/include/node -I../include -I../../libislet/include native/areole_napi.c -L../lib -Wl,-rpath,../lib -lareole -lm -o build/Release/areole_node.node 2>/dev/null || true",
     "build:wasm": "make -C .. wasm",
-    "build": "npm run build:wasm",
+    "build": "npm run build:native && npm run build:wasm",
     "test": "node --test tests/areole.test.mjs"
   },
   "peerDependencies": {
     "@tty-pt/stele": ">=1.7.0"
   },
   "devDependencies": {
+    "@tty-pt/islet": "^1.6.2",
     "@tty-pt/stele": "^1.7.0"
   },
   "keywords": [
@@ -35,5 +37,14 @@
     "multi-scale"
   ],
   "author": "Paulo Quirino <q@qnixsoft.com>",
-  "license": "BSD-2-Clause"
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tty-pt/libareole.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/tty-pt/libareole/tree/main/npm#readme",
+  "bugs": {
+    "url": "https://github.com/tty-pt/libareole/issues"
+  }
 }

@@ -1,6 +1,11 @@
-import { loadWasmModule, getSubstrate } from "@tty-pt/stele";
+import { loadWasmModule, loadNativeAddon, getSubstrate } from "@tty-pt/stele";
 
+const nativeBinding = loadNativeAddon ? loadNativeAddon(import.meta.url, "areole") : null;
 let wasmInstance = null;
+
+export function getAreoleNative() {
+  return nativeBinding;
+}
 
 export function getAreoleWasm() {
   if (wasmInstance) return wasmInstance;

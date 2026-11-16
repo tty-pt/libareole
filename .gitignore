@@ -6,3 +6,6 @@ obj/
 *.a
 npm/node_modules/
 npm/build/
+*.d
+objects-set.mk
+npm/dist/*.wasm
