@@ -1004,12 +1004,15 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	sys->frame_populates_count++;
 	node->flags &= ~AR_NODE_FLAG_DEFERRED;
 
+	bool has_reusable_nodes = (parent_node != NULL ||
+	                           child_nodes[0] != NULL || child_nodes[1] != NULL ||
+	                           child_nodes[2] != NULL || child_nodes[3] != NULL);
+
 	size_t idx = 0;
-	if (sys->row_sampler && !can_reuse_hierarchy) {
-		int32_t wx_step = (int32_t)(node->w / gdim);
+	if (sys->row_sampler && !has_reusable_nodes) {
 		for (int r = 0; r <= gdim; r++) {
 			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
-			sys->row_sampler(sys->user_ctx, world, level, wy, ox, wx_step, (uint32_t)vdim, &mut_samples[idx]);
+			sys->row_sampler(sys->user_ctx, world, level, wy, ox, node->w, (uint32_t)vdim, &mut_samples[idx]);
 			sys->stats.sampler_invocations_total += (uint32_t)vdim;
 			for (int c = 0; c <= gdim; c++) {
 				ar_sample_t *s = &mut_samples[idx];

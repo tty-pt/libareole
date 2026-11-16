@@ -98,7 +98,7 @@ typedef void (*ar_sampler_fn)(void *user_ctx, uint16_t world, uint8_t level,
 
 /* Optional user-supplied row-batch sampler callback for scanline vectorization */
 typedef void (*ar_row_sampler_fn)(void *user_ctx, uint16_t world, uint8_t level,
-                                  int32_t wy, int32_t wx_start, int32_t wx_step,
+                                  int32_t wy, int32_t ox, int32_t span_w,
                                   uint32_t count, ar_sample_t *out_row);
 
 /* Optional user-supplied sparsity callback: returns true if discrete data exists */
