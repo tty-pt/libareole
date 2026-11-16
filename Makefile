@@ -9,14 +9,14 @@ LDLIBS-alpine :=
 CFLAGS := -I./include -I../libislet/include -O2 -Wno-overlength-strings ${CFLAGS} $(EXTRA_CFLAGS)
 
 sync-npm-headers: include/ttypt/areole.h include/ttypt/areole_glsl.h
-	@mkdir -p npm/include/ttypt
-	@cp -f include/ttypt/areole.h include/ttypt/areole_glsl.h npm/include/ttypt/
+	@install -d npm/include/ttypt
+	@install -m 644 include/ttypt/areole.h include/ttypt/areole_glsl.h npm/include/ttypt/
 
 all: sync-npm-headers
 
 wasm: sync-npm-headers ${wasmtarget}
-	@cp -f npm/dist/areole.wasm npm/dist/chunk.wasm
-	@if [ -d ../libchunk/npm/dist ]; then cp -f npm/dist/areole.wasm ../libchunk/npm/dist/chunk.wasm; fi
+	@install -m 644 npm/dist/areole.wasm npm/dist/chunk.wasm
+	@if [ -d ../libchunk/npm/dist ]; then install -m 644 npm/dist/areole.wasm ../libchunk/npm/dist/chunk.wasm; fi
 
 test: all bin/test_areole${EXE} bin/test_glsl${EXE}
 	./bin/test_areole${EXE}
