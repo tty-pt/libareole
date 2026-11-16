@@ -37,8 +37,9 @@ extern "C" {
 
 /* Canonical Node & Sample Flags */
 #define AR_NODE_FLAG_USER0       (1u << 0)
+#define AR_NODE_FLAG_DEFERRED    (1u << 30)
 #define AR_NODE_FLAG_SPARSE      (1u << 31)
-#define AR_NODE_USER_FLAGS_MASK  0x7FFFFFFFu
+#define AR_NODE_USER_FLAGS_MASK  0x3FFFFFFFu
 
 /* Default Configuration Constants */
 #define AR_DEFAULT_VALUE_SCALE          16.0f
@@ -95,6 +96,11 @@ typedef struct {
 typedef void (*ar_sampler_fn)(void *user_ctx, uint16_t world, uint8_t level,
                               int32_t wx, int32_t wy, ar_sample_t *out);
 
+/* Optional user-supplied row-batch sampler callback for scanline vectorization */
+typedef void (*ar_row_sampler_fn)(void *user_ctx, uint16_t world, uint8_t level,
+                                  int32_t wy, int32_t wx_start, int32_t wx_step,
+                                  uint32_t count, ar_sample_t *out_row);
+
 /* Optional user-supplied sparsity callback: returns true if discrete data exists */
 typedef bool (*ar_sparsity_fn)(void *user_ctx, uint16_t world, uint8_t level,
                                int32_t ox, int32_t oy, int32_t w, int32_t h);
@@ -132,8 +138,10 @@ typedef struct {
 	int32_t          period_x;             /* Optional toroidal world period in world units along X (0 = auto/unbounded) */
 	int32_t          period_y;             /* Optional toroidal world period in world units along Y (0 = auto/unbounded) */
 	ar_sampler_fn    sampler;              /* Required vertex sampler callback */
+	ar_row_sampler_fn row_sampler;         /* Optional fast scanline/row sampler */
 	ar_sparsity_fn   sparsity;             /* Optional discrete sparsity callback */
 	void            *user_ctx;             /* Opaque context passed to sampler and sparsity */
+	uint32_t         max_populates_per_frame; /* Optional frame populate budget (0 = unlimited / use cull_opts) */
 	uint32_t         map_capacity;         /* Optional spatial hash map capacity override (0 = pool_capacity * 2) */
 	ar_interp_mode_t interp_mode;          /* Probe interpolation curve mode (0 = AR_INTERP_SMOOTHSTEP) */
 	ar_interp_fn     interp_fn;            /* Optional custom 1D interpolation weight callback (overrides interp_mode) */

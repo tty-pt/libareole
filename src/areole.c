@@ -462,8 +462,11 @@ struct ar_system {
 	int32_t           period_x;
 	int32_t           period_y;
 	ar_sampler_fn     sampler;
+	ar_row_sampler_fn row_sampler;
 	ar_sparsity_fn    sparsity;
 	void             *user_ctx;
+	uint32_t          max_populates_per_frame;
+	uint32_t          frame_populates_count;
 	uint32_t          map_capacity;
 	ar_interp_mode_t  interp_mode;
 	ar_interp_fn      interp_fn;
@@ -692,8 +695,11 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->target_quad_px = (cfg->target_quad_px > 0.0f) ? cfg->target_quad_px : AR_DEFAULT_TARGET_QUAD_PX;
 	sys->margin = (cfg->margin >= 0.0f) ? cfg->margin : 0.0f;
 	sys->sampler = cfg->sampler;
+	sys->row_sampler = cfg->row_sampler;
 	sys->sparsity = cfg->sparsity;
 	sys->user_ctx = cfg->user_ctx;
+	sys->max_populates_per_frame = cfg->max_populates_per_frame;
+	sys->frame_populates_count = 0;
 	sys->map_capacity = (cfg->map_capacity > 0) ? cfg->map_capacity : ((uint32_t)pool_cap * 2u);
 	sys->interp_mode = cfg->interp_mode;
 	sys->interp_fn = cfg->interp_fn;
@@ -777,6 +783,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 	if (!sys)
 		return;
 	sys->current_tick++;
+	sys->frame_populates_count = 0;
 	for (size_t i = 0; i < sys->pool_capacity; i++) {
 		sys->pool_meta[i].active_view_mask = 0;
 	}
@@ -789,57 +796,66 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 
 	/* 1. Fast O(1) Islet spatial map lookup */
 	uint32_t hit_slot = 0;
+	int slot = -1;
+	bool upgrading = false;
 	if (islet_quad_map_get(&sys->map, key, &hit_slot)) {
 		if (hit_slot < sys->pool_capacity && sys->pool_meta[hit_slot].state == 1) {
 			ar_node_t *node = &sys->pool[hit_slot];
 			sys->pool_meta[hit_slot].last_used_tick = sys->current_tick;
 			sys->pool_meta[hit_slot].last_touch_frame = sys->current_tick;
 			sys->stats.cache_hits_total++;
-			return node;
+			if ((node->flags & AR_NODE_FLAG_DEFERRED) &&
+			    (sys->max_populates_per_frame == 0 || sys->frame_populates_count < sys->max_populates_per_frame)) {
+				slot = (int)hit_slot;
+				upgrading = true;
+			} else {
+				return node;
+			}
 		}
 	}
 
 	sys->stats.cache_misses_total++;
 
 	/* 2. Find an empty slot or evict oldest LRU slot not active this frame */
-	int slot = -1;
-	for (size_t i = 0; i < sys->pool_capacity; i++) {
-		if (sys->pool_meta[i].state == 0) {
-			slot = (int)i;
-			break;
-		}
-	}
-
-	if (slot < 0) {
-		uint32_t oldest_tick = sys->current_tick;
+	if (!upgrading) {
 		for (size_t i = 0; i < sys->pool_capacity; i++) {
-			if (sys->pool_meta[i].active_view_mask == 0) {
-				if (sys->pool_meta[i].last_used_tick < oldest_tick) {
-					oldest_tick = sys->pool_meta[i].last_used_tick;
-					slot = (int)i;
-				}
+			if (sys->pool_meta[i].state == 0) {
+				slot = (int)i;
+				break;
 			}
 		}
+
 		if (slot < 0) {
-			oldest_tick = sys->current_tick;
+			uint32_t oldest_tick = sys->current_tick;
 			for (size_t i = 0; i < sys->pool_capacity; i++) {
-				if (sys->pool_meta[i].last_used_tick < oldest_tick) {
-					oldest_tick = sys->pool_meta[i].last_used_tick;
-					slot = (int)i;
+				if (sys->pool_meta[i].active_view_mask == 0) {
+					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
+						oldest_tick = sys->pool_meta[i].last_used_tick;
+						slot = (int)i;
+					}
 				}
 			}
-		}
-		if (slot < 0) {
-			oldest_tick = 0xFFFFFFFFu;
-			for (size_t i = 0; i < sys->pool_capacity; i++) {
-				if (sys->pool_meta[i].last_used_tick < oldest_tick) {
-					oldest_tick = sys->pool_meta[i].last_used_tick;
-					slot = (int)i;
+			if (slot < 0) {
+				oldest_tick = sys->current_tick;
+				for (size_t i = 0; i < sys->pool_capacity; i++) {
+					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
+						oldest_tick = sys->pool_meta[i].last_used_tick;
+						slot = (int)i;
+					}
 				}
 			}
-		}
-		if (slot >= 0 && sys->pool_meta[slot].state == 1) {
-			islet_quad_map_del(&sys->map, sys->pool_meta[slot].morton_key);
+			if (slot < 0) {
+				oldest_tick = 0xFFFFFFFFu;
+				for (size_t i = 0; i < sys->pool_capacity; i++) {
+					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
+						oldest_tick = sys->pool_meta[i].last_used_tick;
+						slot = (int)i;
+					}
+				}
+			}
+			if (slot >= 0 && sys->pool_meta[slot].state == 1) {
+				islet_quad_map_del(&sys->map, sys->pool_meta[slot].morton_key);
+			}
 		}
 	}
 
@@ -863,7 +879,9 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	meta->state = 1;
 	meta->morton_key = key;
 
-	islet_quad_map_put(&sys->map, key, (uint32_t)slot);
+	if (!upgrading) {
+		islet_quad_map_put(&sys->map, key, (uint32_t)slot);
+	}
 
 	/* 3. Query sparsity if provider supplied */
 	if (sys->sparsity) {
@@ -915,56 +933,146 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	uint32_t    *mut_rgba    = (uint32_t *)node->rgba;
 	ar_sample_t *mut_samples = (ar_sample_t *)node->samples;
 
+	/* If per-frame populate budget is exceeded and parent quadtree node exists,
+	 * synthesize node geometry/texture via O(1) integer bilinear upsampling without stalling */
+	bool budget_exceeded = (sys->max_populates_per_frame > 0 &&
+	                        sys->frame_populates_count >= sys->max_populates_per_frame);
+	if (budget_exceeded && parent_node) {
+		size_t idx = 0;
+		int vdim_p = (int32_t)parent_node->vert_dim;
+		const ar_sample_t *ps = parent_node->samples;
+		for (int r = 0; r <= gdim; r++) {
+			int r_even = ((r & 1) == 0);
+			int pr0 = parent_r_off + (r >> 1);
+			int pr1 = r_even ? pr0 : (pr0 + 1);
+			if (pr1 > gdim) pr1 = gdim;
+			for (int c = 0; c <= gdim; c++) {
+				int c_even = ((c & 1) == 0);
+				int pc0 = parent_c_off + (c >> 1);
+				int pc1 = c_even ? pc0 : (pc0 + 1);
+				if (pc1 > gdim) pc1 = gdim;
+
+				ar_sample_t *s = &mut_samples[idx];
+				if (r_even && c_even) {
+					*s = ps[pr0 * vdim_p + pc0];
+				} else if (r_even) {
+					const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
+					const ar_sample_t *s1 = &ps[pr0 * vdim_p + pc1];
+					s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+					s->flags = s0->flags | s1->flags;
+					s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
+					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+						s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
+					}
+				} else if (c_even) {
+					const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
+					const ar_sample_t *s1 = &ps[pr1 * vdim_p + pc0];
+					s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+					s->flags = s0->flags | s1->flags;
+					s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
+					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+						s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
+					}
+				} else {
+					const ar_sample_t *s00 = &ps[pr0 * vdim_p + pc0];
+					const ar_sample_t *s10 = &ps[pr0 * vdim_p + pc1];
+					const ar_sample_t *s01 = &ps[pr1 * vdim_p + pc0];
+					const ar_sample_t *s11 = &ps[pr1 * vdim_p + pc1];
+					s->val = (int16_t)(((int32_t)s00->val + (int32_t)s10->val + (int32_t)s01->val + (int32_t)s11->val) >> 2);
+					s->flags = s00->flags | s10->flags | s01->flags | s11->flags;
+					s->rgba = (((s00->rgba & 0xFCFCFCFCu) >> 2) + ((s10->rgba & 0xFCFCFCFCu) >> 2) +
+					           ((s01->rgba & 0xFCFCFCFCu) >> 2) + ((s11->rgba & 0xFCFCFCFCu) >> 2));
+					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+						s->attr[a] = (uint8_t)(((uint16_t)s00->attr[a] + (uint16_t)s10->attr[a] +
+						                        (uint16_t)s01->attr[a] + (uint16_t)s11->attr[a]) >> 2);
+					}
+				}
+				if (s->val < node->min_val) node->min_val = s->val;
+				if (s->val > node->max_val) node->max_val = s->val;
+				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+
+				mut_values[idx] = s->val;
+				mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				idx++;
+			}
+		}
+		node->flags |= AR_NODE_FLAG_DEFERRED;
+		node->rev++;
+		return node;
+	}
+
+	sys->frame_populates_count++;
+	node->flags &= ~AR_NODE_FLAG_DEFERRED;
+
 	size_t idx = 0;
-	for (int r = 0; r <= gdim; r++) {
-		int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
-		for (int c = 0; c <= gdim; c++) {
-			int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
-			ar_sample_t *s = &mut_samples[idx];
-			bool reused = false;
+	if (sys->row_sampler && !can_reuse_hierarchy) {
+		int32_t wx_step = (int32_t)(node->w / gdim);
+		for (int r = 0; r <= gdim; r++) {
+			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
+			sys->row_sampler(sys->user_ctx, world, level, wy, ox, wx_step, (uint32_t)vdim, &mut_samples[idx]);
+			sys->stats.sampler_invocations_total += (uint32_t)vdim;
+			for (int c = 0; c <= gdim; c++) {
+				ar_sample_t *s = &mut_samples[idx];
+				if (s->val < node->min_val) node->min_val = s->val;
+				if (s->val > node->max_val) node->max_val = s->val;
+				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
 
-			/* Check cached finer child first (every grid point (c, r) in parent maps to
-			 * even grid point (2*(c - qx*half), 2*(r - qy*half)) in child quadrant q) */
-			if (can_reuse_hierarchy) {
-				int qx = (c > half_gdim) ? 1 : 0;
-				int qy = (r > half_gdim) ? 1 : 0;
-				uint8_t q = (uint8_t)(qx | (qy << 1));
-				const ar_node_t *cn = child_nodes[q];
-				if (cn) {
-					int cc = (c - (qx ? half_gdim : 0)) * 2;
-					int cr = (r - (qy ? half_gdim : 0)) * 2;
-					int32_t c_wx = cn->ox + (int32_t)(((int64_t)cc * cn->w) / gdim);
-					int32_t c_wy = cn->oy + (int32_t)(((int64_t)cr * cn->h) / gdim);
-					if (c_wx == wx && c_wy == wy) {
-						*s = cn->samples[cr * vdim + cc];
-						reused = true;
+				mut_values[idx] = s->val;
+				mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				idx++;
+			}
+		}
+	} else {
+		for (int r = 0; r <= gdim; r++) {
+			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
+			for (int c = 0; c <= gdim; c++) {
+				int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
+				ar_sample_t *s = &mut_samples[idx];
+				bool reused = false;
+
+				/* Check cached finer child first (every grid point (c, r) in parent maps to
+				 * even grid point (2*(c - qx*half), 2*(r - qy*half)) in child quadrant q) */
+				if (can_reuse_hierarchy) {
+					int qx = (c > half_gdim) ? 1 : 0;
+					int qy = (r > half_gdim) ? 1 : 0;
+					uint8_t q = (uint8_t)(qx | (qy << 1));
+					const ar_node_t *cn = child_nodes[q];
+					if (cn) {
+						int cc = (c - (qx ? half_gdim : 0)) * 2;
+						int cr = (r - (qy ? half_gdim : 0)) * 2;
+						int32_t c_wx = cn->ox + (int32_t)(((int64_t)cc * cn->w) / gdim);
+						int32_t c_wy = cn->oy + (int32_t)(((int64_t)cr * cn->h) / gdim);
+						if (c_wx == wx && c_wy == wy) {
+							*s = cn->samples[cr * vdim + cc];
+							reused = true;
+						}
+					}
+					/* Otherwise check cached parent at even grid coordinates */
+					if (!reused && parent_node && ((r & 1) == 0) && ((c & 1) == 0)) {
+						int pr = parent_r_off + (r >> 1);
+						int pc = parent_c_off + (c >> 1);
+						int32_t p_wx = parent_node->ox + (int32_t)(((int64_t)pc * parent_node->w) / gdim);
+						int32_t p_wy = parent_node->oy + (int32_t)(((int64_t)pr * parent_node->h) / gdim);
+						if (p_wx == wx && p_wy == wy) {
+							*s = parent_node->samples[pr * vdim + pc];
+							reused = true;
+						}
 					}
 				}
-				/* Otherwise check cached parent at even grid coordinates */
-				if (!reused && parent_node && ((r & 1) == 0) && ((c & 1) == 0)) {
-					int pr = parent_r_off + (r >> 1);
-					int pc = parent_c_off + (c >> 1);
-					int32_t p_wx = parent_node->ox + (int32_t)(((int64_t)pc * parent_node->w) / gdim);
-					int32_t p_wy = parent_node->oy + (int32_t)(((int64_t)pr * parent_node->h) / gdim);
-					if (p_wx == wx && p_wy == wy) {
-						*s = parent_node->samples[pr * vdim + pc];
-						reused = true;
-					}
+
+				if (!reused) {
+					sys->sampler(sys->user_ctx, world, level, wx, wy, s);
+					sys->stats.sampler_invocations_total++;
 				}
+
+				if (s->val < node->min_val) node->min_val = s->val;
+				if (s->val > node->max_val) node->max_val = s->val;
+				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+
+				mut_values[idx] = s->val;
+				mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				idx++;
 			}
-
-			if (!reused) {
-				sys->sampler(sys->user_ctx, world, level, wx, wy, s);
-				sys->stats.sampler_invocations_total++;
-			}
-
-			if (s->val < node->min_val) node->min_val = s->val;
-			if (s->val > node->max_val) node->max_val = s->val;
-			node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
-
-			mut_values[idx] = s->val;
-			mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
-			idx++;
 		}
 	}
 	node->rev++;
