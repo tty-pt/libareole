@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    uses: tty-pt/ci/.github/workflows/all-in-one.yml@main
+    with:
+      name: libareole
+      run_tests: true
+      publish_to: "deb,apk,rpm,pacman,brew,openbsd,winget"
+      deps: "libstele,libcorm,libislet"
+      deps_deb: "libstele,libcorm,libislet,libxxhash-dev"
+      deps_apk: "libstele,libcorm,libislet,xxhash-dev"
+      deps_rpm: "libstele,libcorm,libislet,xxhash-devel"
+      deps_pacman: "libstele,libcorm,libislet,xxhash"
+      deps_brew: "libstele,libcorm,libislet,xxhash"
+      deps_openbsd: "libstele,libcorm,libislet,xxhash"
+      deps_winget: "mingw-w64-x86_64-xxhash,mingw-w64-x86_64-mman-win32"
+      deps_winget_tty: "libstele,libcorm,libislet"
+    secrets: inherit

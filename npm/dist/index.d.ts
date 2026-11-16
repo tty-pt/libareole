@@ -1,10 +1,8 @@
 export interface AreoleSample {
-  elevation: number;
-  biome: number;
-  biome2: number;
-  blend: number;
-  waterDepth: number;
+  value: number;
+  rgba: number;
   flags: number;
+  attr: number[];
 }
 
 export interface AreoleNodeSummary {
@@ -13,9 +11,9 @@ export interface AreoleNodeSummary {
   w: number;
   h: number;
   level: number;
-  hasWater: boolean;
-  minElevation: number;
-  maxElevation: number;
+  flags: number;
+  minValue: number;
+  maxValue: number;
 }
 
 export interface AreoleView {
@@ -39,4 +37,11 @@ export interface AreoleSystem {
 }
 
 export function getAreoleWasm(): any;
-export function createAreoleSystem(baseW?: number, baseH?: number): AreoleSystem;
+export function createAreoleSystem(
+  baseW?: number,
+  baseH?: number,
+  gridDim?: number,
+  poolCap?: number,
+  maxActive?: number,
+  maxLevels?: number
+): AreoleSystem;

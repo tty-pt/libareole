@@ -1,6 +1,11 @@
-import { loadWasmModule, getSubstrate } from "@tty-pt/stele";
+import { loadWasmModule, loadNativeAddon, getSubstrate } from "@tty-pt/stele";
 
+const nativeBinding = loadNativeAddon ? loadNativeAddon(import.meta.url, "areole") : null;
 let wasmInstance = null;
+
+export function getAreoleNative() {
+  return nativeBinding;
+}
 
 export function getAreoleWasm() {
   if (wasmInstance) return wasmInstance;
@@ -8,11 +13,10 @@ export function getAreoleWasm() {
   return wasmInstance;
 }
 
-
-export function createAreoleSystem(baseW = 160, baseH = 128) {
+export function createAreoleSystem(baseW = 160, baseH = 128, gridDim = 32, poolCap = 128, maxActive = 64, maxLevels = 8) {
   const wasm = getAreoleWasm();
   const substrate = getSubstrate();
-  const handle = wasm.exports.ar_wasm_create(baseW, baseH);
+  const handle = wasm.exports.ar_wasm_create(baseW, baseH, gridDim, poolCap, maxActive, maxLevels);
   if (!handle) {
     throw new Error("Failed to create ar_system in WASM linear memory");
   }
@@ -26,9 +30,9 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
       const yaw = view.yaw || 0;
       const fov = view.fov || 0;
       const zoom = view.zoom || 1.0;
-      const vpW = view.viewportW || 1280;
-      const vpH = view.viewportH || 720;
-      const effDist = view.effCamDist || 400;
+      const vpW = view.viewportW || 0;
+      const vpH = view.viewportH || 0;
+      const effDist = view.effCamDist || 0;
 
       const activeCount = wasm.exports.ar_wasm_update(
         handle,
@@ -47,8 +51,11 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
 
       const summaries = [];
       const memBuffer = (wasm.exports.memory || substrate.memory).buffer;
+      const getNodePtr = wasm.exports.ar_wasm_get_system_node_ptr
+        ? (idx) => wasm.exports.ar_wasm_get_system_node_ptr(handle, idx)
+        : (idx) => wasm.exports.ar_wasm_get_node_ptr(handle, idx);
       for (let i = 0; i < activeCount; i++) {
-        const nodePtr = wasm.exports.ar_wasm_get_node_ptr(i);
+        const nodePtr = getNodePtr(i);
         if (!nodePtr) continue;
         const u32 = new Uint32Array(memBuffer, nodePtr, 16);
         const i32 = new Int32Array(memBuffer, nodePtr, 8);
@@ -61,9 +68,9 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
           w: i32[2],
           h: i32[3],
           level: u8[16],
-          hasWater: (u32[7] & 1) !== 0,
-          minElevation: i16[16] / 16.0,
-          maxElevation: i16[17] / 16.0
+          flags: u32[5],
+          minValue: i16[12] / 16.0,
+          maxValue: i16[13] / 16.0
         });
       }
       return summaries;
@@ -82,12 +89,10 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
       const u32 = new Uint32Array(mem, outPtr, 5);
 
       const res = {
-        elevation: i16[0] / 16.0,
-        biome: u8[12],
-        biome2: u8[13],
-        blend: u8[14],
-        waterDepth: u8[15],
-        flags: u32[2]
+        value: i16[0] / 16.0,
+        rgba: u32[1],
+        flags: u32[2],
+        attr: Array.from(u8.subarray(12, 20))
       };
       wasm.exports.free(outPtr);
       return res;
@@ -102,4 +107,3 @@ export function createAreoleSystem(baseW = 160, baseH = 128) {
     }
   };
 }
-

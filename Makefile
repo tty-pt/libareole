@@ -1,47 +1,42 @@
-# libareole Makefile — Generic Distance-Adaptive Multi-Scale Spatial Quadtree & LOD Engine
-PREFIX ?= /usr/local
-DESTDIR ?=
+all := libareole
+LDLIBS-libareole := -lm
 
-CC ?= gcc
-CFLAGS ?= -Wall -Wextra -Werror -O2 -Iinclude -I../libislet/include
-LDLIBS ?= -lm
+WASM_SRCS := src/areole.c npm/wasm/areole_wasm.c
 
-WASM_CC ?= clang
-WASM_CFLAGS ?= --target=wasm32-wasi -ffreestanding -flto -O3 -D__wasm__ -fvisibility=hidden -I./include -I../libislet/include -I../mk/include -I/usr/include
-WASM_LDFLAGS ?= -mexec-model=reactor -Wl,--gc-sections -Wl,--no-entry -Wl,--allow-undefined -Wl,--export=malloc -Wl,--export=free \
-	-Wl,--export=ar_wasm_create \
-	-Wl,--export=ar_wasm_destroy \
-	-Wl,--export=ar_wasm_clear \
-	-Wl,--export=ar_wasm_update \
-	-Wl,--export=ar_wasm_probe \
-	-Wl,--export=ar_wasm_get_node_ptr \
-	-Wl,--export=ar_wasm_get_node_count
+include ../mk/include.mk
+LDLIBS-alpine :=
+
+CFLAGS := -I./include -I../libislet/include -O2 -Wno-overlength-strings ${CFLAGS} $(EXTRA_CFLAGS)
+
+sync-npm-headers: include/ttypt/areole.h include/ttypt/areole_glsl.h
+	@install -d npm/include/ttypt
+	@install -m 644 include/ttypt/areole.h include/ttypt/areole_glsl.h npm/include/ttypt/
+
+all: sync-npm-headers
+
+wasm: sync-npm-headers ${wasmtarget}
+	@install -m 644 npm/dist/areole.wasm npm/dist/chunk.wasm
+	@if [ -d ../libchunk/npm/dist ]; then install -m 644 npm/dist/areole.wasm ../libchunk/npm/dist/chunk.wasm; fi
+
+test: all bin/test_areole${EXE} bin/test_glsl${EXE}
+	./bin/test_areole${EXE}
+	./bin/test_glsl${EXE}
+
+bin/test_areole${EXE}: tests/test_areole.c src/areole.c include/ttypt/areole.h
+	@mkdir -p bin
+	${cc} ${CFLAGS} -o $@ tests/test_areole.c src/areole.c -lm
+
+bin/test_glsl${EXE}: tests/test_glsl.c include/ttypt/areole_glsl.h
+	@mkdir -p bin
+	${cc} ${CFLAGS} -o $@ tests/test_glsl.c -lm
+
+${DESTDIR}${PREFIX}/lib/pkgconfig/areole.pc: areole.pc
+	install -d ${DESTDIR}${PREFIX}/lib/pkgconfig
+	install -m 644 areole.pc $@
+
+install: ${DESTDIR}${PREFIX}/lib/pkgconfig/areole.pc
 
 NPM ?= npm
-
-all: lib/libareole.so test wasm
-
-lib/libareole.so: src/areole.c include/ttypt/areole.h
-	@mkdir -p lib
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ src/areole.c $(LDLIBS)
-
-test: bin/test_areole bin/test_glsl
-	./bin/test_areole
-	./bin/test_glsl
-
-bin/test_areole: tests/test_areole.c src/areole.c include/ttypt/areole.h
-	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ tests/test_areole.c src/areole.c $(LDLIBS)
-
-bin/test_glsl: tests/test_glsl.c include/ttypt/areole_glsl.h
-	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ tests/test_glsl.c $(LDLIBS)
-
-wasm: npm/dist/areole.wasm
-
-npm/dist/areole.wasm: npm/wasm/areole_wasm.c src/areole.c include/ttypt/areole.h
-	@mkdir -p npm/dist
-	$(WASM_CC) $(WASM_CFLAGS) $(WASM_LDFLAGS) npm/wasm/areole_wasm.c src/areole.c -o $@
 
 npm-build: wasm
 	@if command -v $(NPM) >/dev/null 2>&1; then \
@@ -50,21 +45,12 @@ npm-build: wasm
 
 npm-test: npm-build
 	@if command -v $(NPM) >/dev/null 2>&1; then \
-		(cd npm && node --test tests/areole.test.mjs); \
+		(cd npm && $(NPM) test); \
 	fi
 
-install: lib/libareole.so areole.pc
-	install -d $(DESTDIR)$(PREFIX)/include/ttypt
-	install -m 644 include/ttypt/areole.h $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -m 644 include/ttypt/areole_glsl.h $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -m 644 $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -m 644 $(DESTDIR)$(PREFIX)/include/ttypt/
-	install -d $(DESTDIR)$(PREFIX)/lib
-	install -m 755 lib/libareole.so $(DESTDIR)$(PREFIX)/lib/
-	install -d $(DESTDIR)$(PREFIX)/lib/pkgconfig
-	install -m 644 areole.pc $(DESTDIR)$(PREFIX)/lib/pkgconfig/
+clean-extra::
+	rm -rf bin npm/build npm/dist/*.wasm
 
-clean:
-	rm -rf bin lib npm/dist/*.wasm
+objects-set.mk: Makefile
 
-.PHONY: all test wasm npm-build npm-test install clean
+.PHONY: all sync-npm-headers test wasm npm-build npm-test install
