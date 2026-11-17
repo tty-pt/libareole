@@ -175,6 +175,36 @@ static void custom_torus_bounds_3d_cb(void *ctx, float ox, float oy, float w, fl
 	*out_span_h = tube_mid * ((h / tc->period_y) * 6.2831853f);
 }
 
+static bool custom_torus_cull_3d_cb(void *ctx, float ox, float oy, float w, float h,
+                                    float z_min, float z_max,
+                                    const float center_xyz[3], float span_w, float span_h)
+{
+	(void)z_min; (void)z_max; (void)span_w; (void)span_h;
+	const struct torus_test_ctx *tc = (const struct torus_test_ctx *)ctx;
+	float du = w / tc->period_x;
+	float dv = h / tc->period_y;
+	float alpha = 3.14159265f * sqrtf(du * du + dv * dv);
+	if (alpha >= 1.15f)
+		return true; /* Keep very coarse parent cells until subdivided */
+
+	float u_mid = ((ox + w * 0.5f) / tc->period_x) * 6.2831853f;
+	float v_mid = ((oy + h * 0.5f) / tc->period_y) * 6.2831853f;
+	/* Outward normal at (u_mid, v_mid) for torus parameterized in custom_torus_bounds_3d_cb:
+	 * pos = (rho*sin(u), -rho*cos(u), -tr*sin(v)) -> normal = (cos(v)*sin(u), -cos(v)*cos(u), -sin(v)) */
+	float nx =  cosf(v_mid) * sinf(u_mid);
+	float ny = -cosf(v_mid) * cosf(u_mid);
+	float nz = -sinf(v_mid);
+	/* Camera eye in test is at (0, -1500, 800) */
+	float vx = 0.0f - center_xyz[0];
+	float vy = -1500.0f - center_xyz[1];
+	float vz = 800.0f - center_xyz[2];
+	float vlen = sqrtf(vx * vx + vy * vy + vz * vz);
+	if (vlen < 1e-3f)
+		return true;
+	float dot_vn = (vx * nx + vy * ny + vz * nz) / vlen;
+	return dot_vn >= -sinf(alpha + 0.08f);
+}
+
 #define TEST_GRID_DIM      32
 #define TEST_POOL_CAP      128
 #define TEST_MAX_ACTIVE    64
@@ -1359,6 +1389,12 @@ int main(void)
 		for (size_t i = 0; i < nm_vis; i++) {
 			assert(m_nodes[i]->level >= 9);
 		}
+
+		/* Verify cull_3d_fn rejects back-hemisphere nodes on the distant Moon */
+		p_opts.cull_3d_fn = custom_torus_cull_3d_cb;
+		size_t nm_vis_culled = ar_system_query_matrix(t_sys, 2, mvp, &p_opts, m_nodes, 128);
+		assert(nm_vis_culled > 0 && nm_vis_culled < nm_vis);
+		p_opts.cull_3d_fn = NULL;
 
 		/* Distant Moon behind the camera at (0, -14000000, +7000000): must be 100% frustum-culled (0 nodes) */
 		struct torus_test_ctx moon_behind_ctx = moon_vis_ctx;

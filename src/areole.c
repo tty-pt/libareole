@@ -480,6 +480,7 @@ struct ar_system {
 	float             split_hysteresis;
 	ar_bounds_fn      bounds_fn;
 	ar_bounds_3d_fn   bounds_3d_fn;
+	ar_cull_3d_fn     cull_3d_fn;
 	void             *bounds_ctx;
 	uint8_t           attr_count;
 	ar_interp_mode_t  attr_interp_mode;
@@ -713,6 +714,7 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->split_hysteresis = (cfg->split_hysteresis > 0.0f) ? cfg->split_hysteresis : 0.0f;
 	sys->bounds_fn = cfg->bounds_fn;
 	sys->bounds_3d_fn = cfg->bounds_3d_fn;
+	sys->cull_3d_fn = cfg->cull_3d_fn;
 	sys->bounds_ctx = cfg->bounds_ctx;
 	sys->attr_count = (cfg->attr_count == 0) ? AR_SAMPLE_ATTR_CAP
 	                  : ((cfg->attr_count <= AR_SAMPLE_ATTR_CAP) ? cfg->attr_count : 0u);
@@ -1386,6 +1388,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	ar_candidate_t *cands = sys->cands_scratch;
 	size_t cand_count = 0;
 
+	ar_cull_3d_fn c3d = (opts && opts->cull_3d_fn) ? opts->cull_3d_fn : sys->cull_3d_fn;
+	void *c3d_ctx = (opts && (opts->cull_3d_fn || opts->bounds_3d_fn || opts->bounds_fn)) ? opts->bounds_ctx : sys->bounds_ctx;
+
 	for (int32_t j = j0; j <= j1; j++) {
 		for (int32_t i = i0; i <= i1; i++) {
 			int32_t rox = i * root_w;
@@ -1395,7 +1400,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			                       b_min, b_max, center_xyz, &span_w, &span_h, &dist_sq);
 
 			if (ar_frustum_test_box(&frustum, b_min[0], b_min[1], b_min[2],
-			                        b_max[0], b_max[1], b_max[2])) {
+			                        b_max[0], b_max[1], b_max[2]) &&
+			    (!c3d || c3d(c3d_ctx, (float)rox, (float)roy, (float)root_w, (float)root_h,
+			                 z_min - margin, z_max + margin, center_xyz, span_w, span_h))) {
 				if (cand_count < max_candidates) {
 					float pw = ar_projected_screen_width_3d(mvp, opts, center_xyz,
 					                                        span_w, span_h, vp_w, vp_h);
@@ -1501,7 +1508,11 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			                       b_min, b_max, center_xyz, &span_w, &span_h, &dist_sq);
 			kids[c].visible = ar_frustum_test_box(&frustum,
 			                                      b_min[0], b_min[1], b_min[2],
-			                                      b_max[0], b_max[1], b_max[2]);
+			                                      b_max[0], b_max[1], b_max[2]) &&
+			                  (!c3d || c3d(c3d_ctx, (float)kids[c].ox, (float)kids[c].oy,
+			                               (float)cw, (float)ch,
+			                               z_min - margin, z_max + margin,
+			                               center_xyz, span_w, span_h));
 			if (kids[c].visible) {
 				kids[c].proj_w = ar_projected_screen_width_3d(mvp, opts, center_xyz,
 				                                              span_w, span_h, vp_w, vp_h);

@@ -119,6 +119,13 @@ typedef void (*ar_bounds_3d_fn)(void *bounds_ctx, float ox, float oy, float w, f
                                 float out_center[3],
                                 float *out_span_w, float *out_span_h);
 
+/* Optional user-supplied 3D manifold visibility/horizon culling callback:
+ * Returns true if the manifold patch [ox, ox + w] x [oy, oy + h] is potentially visible
+ * (e.g. facing the camera / above the planetary horizon limb), or false to cull it before subdivision/population. */
+typedef bool (*ar_cull_3d_fn)(void *bounds_ctx, float ox, float oy, float w, float h,
+                              float z_min, float z_max,
+                              const float center_xyz[3], float span_w, float span_h);
+
 /* Runtime configuration for ar_system_create_ex */
 typedef struct {
 	int32_t          base_w;               /* Level 0 width in world units (required > 0) */
@@ -155,7 +162,8 @@ typedef struct {
 	float            split_hysteresis;     /* Default split/merge hysteresis band when not overridden in view/cull_opts */
 	ar_bounds_fn     bounds_fn;            /* Default vertical envelope callback when not overridden in cull_opts */
 	ar_bounds_3d_fn  bounds_3d_fn;         /* Default 3D manifold AABB callback when not overridden in cull_opts */
-	void            *bounds_ctx;           /* Default opaque context passed to bounds_fn / bounds_3d_fn */
+	ar_cull_3d_fn    cull_3d_fn;           /* Default 3D manifold horizon/visibility culling callback */
+	void            *bounds_ctx;           /* Default opaque context passed to bounds_fn / bounds_3d_fn / cull_3d_fn */
 	uint8_t          attr_count;           /* Active sample attribute channels (0 = AR_SAMPLE_ATTR_CAP; > AR_SAMPLE_ATTR_CAP = 0) */
 	ar_interp_mode_t attr_interp_mode;     /* Attribute probe mode (0 or AR_INTERP_NEAREST = nearest, AR_INTERP_LINEAR/QUINTIC = continuous) */
 	bool             interpolate_attrs;    /* When true and attr_interp_mode == 0, interpolate attrs using AR_INTERP_SMOOTHSTEP */
@@ -209,7 +217,8 @@ typedef struct {
 	float           split_hysteresis;        /* Optional split/merge hysteresis band (e.g. 0.12f) to prevent movement flicker */
 	ar_bounds_fn    bounds_fn;               /* Optional generic vertical envelope callback */
 	ar_bounds_3d_fn bounds_3d_fn;            /* Optional generic 3D manifold AABB callback */
-	void           *bounds_ctx;              /* Opaque context passed to bounds_fn / bounds_3d_fn */
+	ar_cull_3d_fn   cull_3d_fn;              /* Optional generic 3D manifold horizon/visibility culling callback */
+	void           *bounds_ctx;              /* Opaque context passed to bounds_fn / bounds_3d_fn / cull_3d_fn */
 	float        horizon_reach_mult;      /* Optional perspective sag horizon reach multiplier (0 = 2.5f) */
 	float        max_ray_span_mult;       /* Optional perspective ray unprojection span multiplier (0 = 6.0f) */
 	float        persp_z_low_mult;        /* Optional perspective ray lower Z-plane multiplier (0 = 0.45f) */
