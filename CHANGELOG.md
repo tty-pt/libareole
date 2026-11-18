@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] (target: v1.2.0)
+- **Scanline Row-Batch Sampler & Per-Frame Populate Budgeting (`ar_row_sampler_fn`, `include/ttypt/areole.h`, `src/areole.c`)**:
+  - Added optional `ar_row_sampler_fn` (`cfg.row_sampler`) scanline callback passing exact `span_w` world coordinates for vectorized row sampling and watertight cross-LOD boundary vertex welding.
+  - Added `max_populates_per_frame` in `ar_config_t` and `max_populates_per_query` in `ar_cull_opts_t` to cap new-chunk synthesis per frame while falling back to cached ancestor LOD nodes.
+- **Pluggable 3D Manifold Normal-Cone & Horizon Culling Callback (`ar_cull_3d_fn`, `include/ttypt/areole.h`, `src/areole.c`)**:
+  - Added `ar_cull_3d_fn` (`cull_3d_fn` in `ar_config_t` and `ar_cull_opts_t`) to cull back-facing or beyond-the-horizon curved manifold patches before quadtree subdivision and vertex population.
+- **Asynchronous Workqueue (`stele_wq`) Chunk Population (`include/ttypt/areole.h`, `src/areole.c`)**:
+  - Integrated `<ttypt/wq.h>` (`struct stl_wq *wq` in `ar_config_t`, `AR_NODE_FLAG_DEFERRED`) so unpopulated leaf nodes submit zero-allocation background tasks (`stl_wq_submit`) and render parent ancestor fallbacks until worker population completes.
+
 ## [1.1.0] - 2026-11-16
 - **Pluggable 3D Manifold Bounding Box Callback (`ar_bounds_3d_fn`, `include/ttypt/areole.h`, `src/areole.c`)**:
   - Added `ar_bounds_3d_fn` to `ar_config_t` and `ar_cull_opts_t` to map 2D manifold patches `[ox, ox + w] x [oy, oy + h]` and normal displacement `[z_min, z_max]` into true 3D Cartesian AABBs, centers, and chord spans for non-Euclidean and curved planetary frustum culling and LOD splitting.

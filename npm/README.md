@@ -23,10 +23,10 @@
 
 1. **Single-Arena Zero-Allocation Traversal**:
    - Allocates the entire quadtree node pool, vertex sample buffers, and spatial hash table in a single contiguous arena at startup (`createAreoleSystem`), performing zero heap allocations during per-frame camera motion.
-2. **Rigorous 6-Plane Gribb-Hartmann Frustum Culling**:
-   - Extracts exact frustum planes from the active camera view (supporting full $360^\circ$ yaw, $0^\circ\text{–}85^\circ$ pitch, perspective/orthographic projection, and planetary horizon curvature sag).
-3. **Coarse-First Priority LOD Selection ($O(1)$ Active Budget)**:
-   - Guarantees complete 4-quadrant horizon coverage within a bounded `maxActive` chunk budget while subdividing near-camera quads to target screen-space pixel density.
+2. **Rigorous 6-Plane Gribb-Hartmann & 3D Manifold Horizon Culling**:
+   - Extracts exact frustum planes from the active camera view (supporting full $360^\circ$ yaw, $0^\circ\text{–}85^\circ$ pitch, perspective/orthographic projection, planetary horizon curvature sag, and pluggable 3D manifold AABB / normal-cone horizon culling callbacks `ar_bounds_3d_fn` and `ar_cull_3d_fn`).
+3. **Coarse-First Priority LOD Selection, Scanline Batching & Async Workqueue Population ($O(1)$ Active Budget)**:
+   - Guarantees complete 4-quadrant horizon coverage within a bounded `maxActive` chunk budget while subdividing near-camera quads to target screen-space pixel density, with vectorized scanline callbacks (`ar_row_sampler_fn`), watertight cross-LOD seam welding, and background worker population (`<ttypt/wq.h>`).
 4. **Hierarchical Point & Attribute Probing (`.probe(wx, wy)`)**:
    - Evaluates continuous interpolated scalar displacement (`value`), packed 32-bit `rgba`, `flags`, and 8-byte material/biome payload (`attr[0..7]`) at any world coordinate.
 
