@@ -24,7 +24,7 @@ test: all bin/test_areole${EXE} bin/test_glsl${EXE}
 
 bin/test_areole${EXE}: tests/test_areole.c src/areole.c include/ttypt/areole.h
 	@mkdir -p bin
-	${cc} ${CFLAGS} -o $@ tests/test_areole.c src/areole.c -lm
+	${cc} ${CFLAGS} -o $@ tests/test_areole.c src/areole.c ../libstele/src/stele_wq.c -lm -lpthread
 
 bin/test_glsl${EXE}: tests/test_glsl.c include/ttypt/areole_glsl.h
 	@mkdir -p bin

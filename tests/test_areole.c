@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "ttypt/areole.h"
+#include <ttypt/wq.h>
 
 /* Pure analytical multi-octave procedural sampler (zero libchaff dependency) */
 static void analytical_multioctave_sampler(void *user_ctx, uint16_t world, uint8_t level,
@@ -1490,6 +1491,52 @@ int main(void)
 		/* Beyond r = 12000 wu (r_near = 11500 -> D_min = 65.34 > max_extent 64): O(1) cell cull returns false! */
 		assert(ar_scale_cell_cull(&cell, &sa, 12000.0f, 500.0f, &cutoff) == false);
 		printf("  [PASS] Universal solid-angle law & scale-ordered cell prefix culling verified\n");
+	}
+
+	/* 26. Asynchronous Workqueue (stl_wq) Deferred Population & Frame Commit */
+	{
+		stl_wq_t *wq = stl_wq_create("test-areole-wq", 2, 64);
+		assert(wq != NULL);
+
+		ar_config_t cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.base_w = 160;
+		cfg.base_h = 128;
+		cfg.grid_dim = 16;
+		cfg.pool_capacity = 32;
+		cfg.max_active = 16;
+		cfg.max_levels = 6;
+		cfg.max_populates_per_frame = 1; /* Only 1 sync populate per frame; next misses go to wq! */
+		cfg.wq = wq;
+		cfg.sampler = level_dependent_sampler;
+
+		ar_system_t *wq_sys = ar_system_create_ex(&cfg);
+		assert(wq_sys != NULL);
+
+		ar_system_begin_frame(wq_sys);
+		/* 1st populate (parent L1 at 0,0) consumes the 1 sync budget slot -> val = 100 */
+		const ar_node_t *p_node = ar_system_ensure(wq_sys, 1, 1, 0, 0);
+		assert(p_node != NULL);
+		assert((p_node->flags & AR_NODE_FLAG_DEFERRED) == 0);
+		assert(p_node->values[0] == 100);
+
+		/* 2nd populate in the same frame (child L0 at 0,0) exceeds budget -> immediately upsampled from parent (val=100, DEFERRED) and queued on wq! */
+		const ar_node_t *c_node = ar_system_ensure(wq_sys, 1, 0, 0, 0);
+		assert(c_node != NULL);
+		assert((c_node->flags & AR_NODE_FLAG_DEFERRED) != 0);
+		assert(c_node->values[0] == 100);
+		uint32_t rev_before = c_node->rev;
+
+		/* Drain the workqueue and begin next frame: staging buffers commit into c_node -> val = 0 (L0), DEFERRED cleared, rev incremented! */
+		stl_wq_drain(wq);
+		ar_system_begin_frame(wq_sys);
+		assert((c_node->flags & AR_NODE_FLAG_DEFERRED) == 0);
+		assert(c_node->values[0] == 0);
+		assert(c_node->rev > rev_before);
+
+		ar_system_destroy(wq_sys);
+		stl_wq_destroy(wq);
+		printf("  [PASS] Asynchronous stl_wq deferred node population & frame staging commit verified\n");
 	}
 
 	ar_system_destroy(cs);

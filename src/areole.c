@@ -435,11 +435,29 @@ typedef struct {
 } ar_candidate_t;
 
 typedef struct {
-	uint64_t morton_key;
-	uint32_t last_used_tick;
-	uint32_t last_touch_frame;
-	uint32_t active_view_mask;
-	uint8_t  state;
+	uint64_t       morton_key;
+	uint32_t       last_used_tick;
+	uint32_t       last_touch_frame;
+	uint32_t       active_view_mask;
+	uint8_t        state;
+#ifdef TTYPT_WQ_H
+	stl_wq_task_t  async_task;
+	struct ar_system *async_sys;
+	uint32_t       async_slot;
+	uint64_t       async_key;
+	uint16_t       async_world;
+	uint8_t        async_level;
+	int32_t        async_ox;
+	int32_t        async_oy;
+	int32_t        async_w;
+	int32_t        async_h;
+	uint32_t       async_flags;
+	int16_t        async_min_val;
+	int16_t        async_max_val;
+	int16_t       *staging_values;
+	uint32_t      *staging_rgba;
+	ar_sample_t   *staging_samples;
+#endif
 } ar_node_meta_t;
 
 struct ar_system {
@@ -486,6 +504,7 @@ struct ar_system {
 	ar_interp_mode_t  attr_interp_mode;
 	bool              interpolate_attrs;
 	uint32_t          current_tick;
+	struct stl_wq    *wq;
 
 	/* Pointers into single contiguous allocation */
 	ar_node_t        *pool;
@@ -494,6 +513,7 @@ struct ar_system {
 	ar_candidate_t   *cands_scratch;
 	ar_candidate_t   *active_cands_scratch;
 	size_t            active_count;
+	uint8_t          *staging_arena;
 
 	/* Backing libislet in-memory quadtree spatial database */
 	islet_quad_map_t  map;
@@ -721,10 +741,16 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->attr_interp_mode = cfg->attr_interp_mode;
 	sys->interpolate_attrs = cfg->interpolate_attrs;
 	sys->current_tick = 1;
+	sys->wq = cfg->wq;
+	sys->staging_arena = NULL;
 
 	if (!islet_quad_map_init(&sys->map, (size_t)sys->map_capacity)) {
 		free(arena);
 		return NULL;
+	}
+
+	if (cfg->wq != NULL) {
+		ar_system_set_wq(sys, cfg->wq);
 	}
 
 	sys->stats.pool_capacity = pool_cap;
@@ -757,10 +783,154 @@ ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
 	return ar_system_create_ex(&cfg);
 }
 
+#ifdef TTYPT_WQ_H
+#if defined(__GNUC__) && !defined(__wasm__)
+__attribute__((weak)) uint32_t stl_cpu_count(void) { return 1u; }
+__attribute__((weak)) stl_wq_t *stl_wq_create(const char *name, uint32_t nthreads, uint32_t capacity)
+{
+	(void)name; (void)nthreads; (void)capacity;
+	return NULL;
+}
+__attribute__((weak)) int stl_wq_submit(stl_wq_t *wq, stl_wq_task_t *task, stl_wq_fn fn, void *arg)
+{
+	(void)wq;
+	if (!task || !fn) return -1;
+	task->fn = fn;
+	task->arg = arg;
+	task->state = STL_WQ_RUNNING;
+	fn(arg);
+	task->state = STL_WQ_DONE;
+	return 0;
+}
+__attribute__((weak)) uint32_t stl_wq_step(stl_wq_t *wq, uint32_t max_tasks)
+{
+	(void)wq; (void)max_tasks;
+	return 0u;
+}
+__attribute__((weak)) void stl_wq_wait(stl_wq_t *wq, stl_wq_task_t *task)
+{
+	(void)wq;
+	if (task) task->state = STL_WQ_DONE;
+}
+__attribute__((weak)) void stl_wq_drain(stl_wq_t *wq)
+{
+	(void)wq;
+}
+__attribute__((weak)) void stl_wq_destroy(stl_wq_t *wq)
+{
+	(void)wq;
+}
+#endif
+
+static void ar_async_populate_worker(void *ctx)
+{
+	ar_node_meta_t *meta = (ar_node_meta_t *)ctx;
+	ar_system_t *sys = meta ? meta->async_sys : NULL;
+	if (!sys || !meta->staging_samples || !meta->staging_values || !meta->staging_rgba)
+		return;
+
+	int32_t gdim = (int32_t)sys->grid_dim;
+	if (gdim < 1) gdim = 1;
+	int32_t vdim = gdim + 1;
+	uint16_t world = meta->async_world;
+	uint8_t level = meta->async_level;
+	int32_t ox = meta->async_ox;
+	int32_t oy = meta->async_oy;
+	int32_t w = meta->async_w;
+	int32_t h = meta->async_h;
+
+	int16_t min_val = 32767;
+	int16_t max_val = -32768;
+	uint32_t flags = 0;
+	if (sys->sparsity) {
+		if (sys->sparsity(sys->user_ctx, world, level, ox, oy, w, h))
+			flags |= AR_NODE_FLAG_SPARSE;
+	}
+
+	size_t idx = 0;
+	if (sys->row_sampler) {
+		for (int r = 0; r <= gdim; r++) {
+			int32_t wy = oy + (int32_t)(((int64_t)r * h) / gdim);
+			sys->row_sampler(sys->user_ctx, world, level, wy, ox, w, (uint32_t)vdim, &meta->staging_samples[idx]);
+			for (int c = 0; c <= gdim; c++) {
+				ar_sample_t *s = &meta->staging_samples[idx];
+				if (s->val < min_val) min_val = s->val;
+				if (s->val > max_val) max_val = s->val;
+				flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+				meta->staging_values[idx] = s->val;
+				meta->staging_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				idx++;
+			}
+		}
+	} else {
+		for (int r = 0; r <= gdim; r++) {
+			int32_t wy = oy + (int32_t)(((int64_t)r * h) / gdim);
+			for (int c = 0; c <= gdim; c++) {
+				int32_t wx = ox + (int32_t)(((int64_t)c * w) / gdim);
+				ar_sample_t *s = &meta->staging_samples[idx];
+				sys->sampler(sys->user_ctx, world, level, wx, wy, s);
+				if (s->val < min_val) min_val = s->val;
+				if (s->val > max_val) max_val = s->val;
+				flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+				meta->staging_values[idx] = s->val;
+				meta->staging_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				idx++;
+			}
+		}
+	}
+
+	meta->async_min_val = min_val;
+	meta->async_max_val = max_val;
+	meta->async_flags = flags;
+}
+#endif
+
+void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq)
+{
+	if (!sys)
+		return;
+#ifdef TTYPT_WQ_H
+	if (sys->wq && sys->wq != wq) {
+		stl_wq_drain(sys->wq);
+	}
+	sys->wq = wq;
+	if (wq && !sys->staging_arena) {
+		size_t per_node_vals = ar_align8((size_t)sys->vert_count * sizeof(int16_t));
+		size_t per_node_rgba = ar_align8((size_t)sys->vert_count * sizeof(uint32_t));
+		size_t per_node_samples = ar_align8((size_t)sys->vert_count * sizeof(ar_sample_t));
+		size_t per_node_arena = per_node_vals + per_node_rgba + per_node_samples;
+		uint8_t *s_arena = (uint8_t *)calloc((size_t)sys->pool_capacity, per_node_arena);
+		if (s_arena) {
+			sys->staging_arena = s_arena;
+			uint8_t *cur = s_arena;
+			for (uint16_t i = 0; i < sys->pool_capacity; i++) {
+				sys->pool_meta[i].staging_values = (int16_t *)cur;
+				cur += per_node_vals;
+				sys->pool_meta[i].staging_rgba = (uint32_t *)cur;
+				cur += per_node_rgba;
+				sys->pool_meta[i].staging_samples = (ar_sample_t *)cur;
+				cur += per_node_samples;
+			}
+		}
+	}
+#else
+	(void)wq;
+#endif
+}
+
 void ar_system_destroy(ar_system_t *sys)
 {
 	if (!sys)
 		return;
+#ifdef TTYPT_WQ_H
+	if (sys->wq) {
+		for (size_t i = 0; i < sys->pool_capacity; i++) {
+			if (stl_wq_busy(&sys->pool_meta[i].async_task))
+				stl_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
+		}
+	}
+#endif
+	free(sys->staging_arena);
 	islet_quad_map_destroy(&sys->map);
 	free(sys);
 }
@@ -769,6 +939,15 @@ void ar_system_clear(ar_system_t *sys)
 {
 	if (!sys)
 		return;
+#ifdef TTYPT_WQ_H
+	if (sys->wq) {
+		for (size_t i = 0; i < sys->pool_capacity; i++) {
+			if (stl_wq_busy(&sys->pool_meta[i].async_task))
+				stl_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
+			sys->pool_meta[i].async_task.state = STL_WQ_IDLE;
+		}
+	}
+#endif
 	for (size_t i = 0; i < sys->pool_capacity; i++) {
 		sys->pool_meta[i].state = 0;
 		sys->pool_meta[i].last_used_tick = 0;
@@ -786,6 +965,35 @@ void ar_system_begin_frame(ar_system_t *sys)
 		return;
 	sys->current_tick++;
 	sys->frame_populates_count = 0;
+#ifdef TTYPT_WQ_H
+	if (sys->wq && sys->staging_arena) {
+		/* Cooperatively step up to 4 background chunks when running without worker threads */
+		stl_wq_step(sys->wq, 4u);
+		size_t vals_bytes = (size_t)sys->vert_count * sizeof(int16_t);
+		size_t rgba_bytes = (size_t)sys->vert_count * sizeof(uint32_t);
+		size_t samp_bytes = (size_t)sys->vert_count * sizeof(ar_sample_t);
+		for (size_t i = 0; i < sys->pool_capacity; i++) {
+			ar_node_meta_t *meta = &sys->pool_meta[i];
+			meta->active_view_mask = 0;
+			if (stl_wq_done(&meta->async_task)) {
+				ar_node_t *node = &sys->pool[i];
+				if (meta->state == 1 && meta->morton_key == meta->async_key &&
+				    (node->flags & AR_NODE_FLAG_DEFERRED)) {
+					memcpy((int16_t *)node->values, meta->staging_values, vals_bytes);
+					memcpy((uint32_t *)node->rgba, meta->staging_rgba, rgba_bytes);
+					memcpy((ar_sample_t *)node->samples, meta->staging_samples, samp_bytes);
+					node->min_val = meta->async_min_val;
+					node->max_val = meta->async_max_val;
+					node->flags = meta->async_flags;
+					node->rev++;
+					sys->stats.sampler_invocations_total += sys->vert_count;
+				}
+				meta->async_task.state = STL_WQ_IDLE;
+			}
+		}
+		return;
+	}
+#endif
 	for (size_t i = 0; i < sys->pool_capacity; i++) {
 		sys->pool_meta[i].active_view_mask = 0;
 	}
@@ -806,6 +1014,13 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			sys->pool_meta[hit_slot].last_used_tick = sys->current_tick;
 			sys->pool_meta[hit_slot].last_touch_frame = sys->current_tick;
 			sys->stats.cache_hits_total++;
+#ifdef TTYPT_WQ_H
+			if ((node->flags & AR_NODE_FLAG_DEFERRED) &&
+			    sys->wq && sys->staging_arena &&
+			    stl_wq_busy(&sys->pool_meta[hit_slot].async_task)) {
+				return node;
+			}
+#endif
 			if ((node->flags & AR_NODE_FLAG_DEFERRED) &&
 			    (sys->max_populates_per_frame == 0 || sys->frame_populates_count < sys->max_populates_per_frame)) {
 				slot = (int)hit_slot;
@@ -830,6 +1045,10 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		if (slot < 0) {
 			uint32_t oldest_tick = sys->current_tick;
 			for (size_t i = 0; i < sys->pool_capacity; i++) {
+#ifdef TTYPT_WQ_H
+				if (stl_wq_busy(&sys->pool_meta[i].async_task))
+					continue;
+#endif
 				if (sys->pool_meta[i].active_view_mask == 0) {
 					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
 						oldest_tick = sys->pool_meta[i].last_used_tick;
@@ -840,6 +1059,10 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			if (slot < 0) {
 				oldest_tick = sys->current_tick;
 				for (size_t i = 0; i < sys->pool_capacity; i++) {
+#ifdef TTYPT_WQ_H
+					if (stl_wq_busy(&sys->pool_meta[i].async_task))
+						continue;
+#endif
 					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
 						oldest_tick = sys->pool_meta[i].last_used_tick;
 						slot = (int)i;
@@ -849,6 +1072,10 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			if (slot < 0) {
 				oldest_tick = 0xFFFFFFFFu;
 				for (size_t i = 0; i < sys->pool_capacity; i++) {
+#ifdef TTYPT_WQ_H
+					if (stl_wq_busy(&sys->pool_meta[i].async_task))
+						continue;
+#endif
 					if (sys->pool_meta[i].last_used_tick < oldest_tick) {
 						oldest_tick = sys->pool_meta[i].last_used_tick;
 						slot = (int)i;
@@ -866,6 +1093,12 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 
 	ar_node_t *node = &sys->pool[slot];
 	ar_node_meta_t *meta = &sys->pool_meta[slot];
+#ifdef TTYPT_WQ_H
+	if (sys->wq && stl_wq_busy(&meta->async_task)) {
+		stl_wq_wait(sys->wq, &meta->async_task);
+	}
+	meta->async_task.state = STL_WQ_IDLE;
+#endif
 	node->world = world;
 	node->level = level;
 	node->ox = ox;
@@ -1000,6 +1233,20 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		}
 		node->flags |= AR_NODE_FLAG_DEFERRED;
 		node->rev++;
+#ifdef TTYPT_WQ_H
+		if (sys->wq && sys->staging_arena && !stl_wq_busy(&meta->async_task)) {
+			meta->async_sys = sys;
+			meta->async_slot = (uint32_t)slot;
+			meta->async_key = key;
+			meta->async_world = world;
+			meta->async_level = level;
+			meta->async_ox = ox;
+			meta->async_oy = oy;
+			meta->async_w = node->w;
+			meta->async_h = node->h;
+			(void)stl_wq_submit(sys->wq, &meta->async_task, ar_async_populate_worker, meta);
+		}
+#endif
 		return node;
 	}
 

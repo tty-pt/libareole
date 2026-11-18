@@ -30,6 +30,11 @@
 #include <string.h>
 #include <math.h>
 #include <ttypt/islet_quad.h>
+#if defined(__has_include) && __has_include(<ttypt/wq.h>)
+#include <ttypt/wq.h>
+#elif defined(__has_include) && __has_include("../../libstele/include/ttypt/wq.h")
+#include "../../libstele/include/ttypt/wq.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -167,6 +172,7 @@ typedef struct {
 	uint8_t          attr_count;           /* Active sample attribute channels (0 = AR_SAMPLE_ATTR_CAP; > AR_SAMPLE_ATTR_CAP = 0) */
 	ar_interp_mode_t attr_interp_mode;     /* Attribute probe mode (0 or AR_INTERP_NEAREST = nearest, AR_INTERP_LINEAR/QUINTIC = continuous) */
 	bool             interpolate_attrs;    /* When true and attr_interp_mode == 0, interpolate attrs using AR_INTERP_SMOOTHSTEP */
+	struct stl_wq   *wq;                   /* Optional workqueue pool for async background chunk population */
 } ar_config_t;
 
 /* Represents an active node in the hierarchical system (public read-only view) */
@@ -290,6 +296,7 @@ ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
 void ar_system_destroy(ar_system_t *sys);
 void ar_system_clear(ar_system_t *sys);
 void ar_system_begin_frame(ar_system_t *sys);
+void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq);
 
 size_t ar_system_eval_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
                            const ar_view_t *view,
