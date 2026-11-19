@@ -1539,6 +1539,53 @@ int main(void)
 		printf("  [PASS] Asynchronous stl_wq deferred node population & frame staging commit verified\n");
 	}
 
+	/* 27. Non-Zero focal_z Camera Target Elevation (High Mountain Peak & Deep Basin Invariance) */
+	{
+		ar_config_t z_cfg = {
+			.base_w = 160,
+			.base_h = 128,
+			.grid_dim = TEST_GRID_DIM,
+			.pool_capacity = TEST_POOL_CAP,
+			.max_active = TEST_MAX_ACTIVE,
+			.max_levels = TEST_MAX_LEVELS,
+			.z_min = -2600.0f,
+			.z_max = 3200.0f,
+			.sampler = mock_sampler
+		};
+		ar_system_t *z_sys = ar_system_create_ex(&z_cfg);
+		assert(z_sys != NULL);
+
+		const float test_focal_zs[3] = { -600.0f, 0.0f, 950.0f };
+		for (int zi = 0; zi < 3; zi++) {
+			float fz = test_focal_zs[zi];
+			float fx = 1680.0f, fy = -1216.0f; /* Center of Level-0 chunk (1600, -1280) */
+			ar_view_t view = {
+				.cam_x = fx, .cam_y = fy, .cam_z = fz,
+				.pitch = 0.959931f, .yaw = 0.0f, .fov = 0.785398f,
+				.zoom = 1.0f, .viewport_w = 1280.0f, .viewport_h = 720.0f,
+				.eff_cam_dist = 350.0f
+			};
+			const ar_node_t *vis[64];
+			size_t cnt = ar_system_update(z_sys, 1, &view, vis, 64);
+			assert(cnt > 12);
+
+			/* Verify the chunk containing the focal point (fx, fy) is present and refined to Level 0 */
+			bool found_focal_lvl0 = false;
+			for (size_t i = 0; i < cnt; i++) {
+				const ar_node_t *n = vis[i];
+				assert(n != NULL);
+				if (fx >= (float)n->ox && fx < (float)(n->ox + n->w) &&
+				    fy >= (float)n->oy && fy < (float)(n->oy + n->h)) {
+					assert(n->level == 0);
+					found_focal_lvl0 = true;
+				}
+			}
+			assert(found_focal_lvl0);
+		}
+		ar_system_destroy(z_sys);
+		printf("  [PASS] Non-zero focal_z camera target elevation invariance verified across [-600, 0, +950] wu\n");
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;

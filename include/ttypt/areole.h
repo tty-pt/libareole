@@ -211,6 +211,7 @@ typedef struct {
 	float           sag_radius;              /* Optional spherical sag radius R (0 = flat or use sys->sag_radius / bounds_fn) */
 	float           sag_tangent_slope;       /* Linear tangent slope beyond sag_radius (0 = sys->sag_tangent_slope or 2.0f) */
 	float           focal_x, focal_y;        /* Focal center for distance priority and sag computation */
+	float           focal_z;                 /* Focal center Z (world units) for camera clip-distance and ground plane intersection */
 	float           margin;                  /* World-space padding margin added to node bounds */
 	float           target_quad_px;          /* Screen-space quad LOD subdivision threshold in pixels */
 	float           viewport_w;              /* Viewport width in pixels */
