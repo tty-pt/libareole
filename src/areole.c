@@ -1135,7 +1135,6 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	bool can_reuse_hierarchy = ((gdim & 1) == 0 && half_gdim > 0);
 
 	const ar_node_t *parent_node = NULL;
-	const ar_node_t *deferred_parent = NULL;
 	int parent_r_off = 0, parent_c_off = 0;
 	const ar_node_t *child_nodes[4] = { NULL, NULL, NULL, NULL };
 
@@ -1145,11 +1144,9 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			uint32_t pslot = 0;
 			if (islet_quad_map_get(&sys->map, pkey, &pslot) &&
 			    pslot < sys->pool_capacity && sys->pool_meta[pslot].state == 1 &&
-			    sys->pool[pslot].world == world && sys->pool[pslot].level == level + 1) {
-				deferred_parent = &sys->pool[pslot];
-				if ((sys->pool[pslot].flags & AR_NODE_FLAG_DEFERRED) == 0) {
-					parent_node = &sys->pool[pslot];
-				}
+			    sys->pool[pslot].world == world && sys->pool[pslot].level == level + 1 &&
+			    (sys->pool[pslot].flags & AR_NODE_FLAG_DEFERRED) == 0) {
+				parent_node = &sys->pool[pslot];
 				uint8_t q = morton_quad_quadrant(key);
 				parent_c_off = (q & 1) ? half_gdim : 0;
 				parent_r_off = (q & 2) ? half_gdim : 0;
@@ -1173,14 +1170,14 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	uint32_t    *mut_rgba    = (uint32_t *)node->rgba;
 	ar_sample_t *mut_samples = (ar_sample_t *)node->samples;
 
-	/* If per-frame populate budget is exceeded and parent quadtree node exists,
+	/* If per-frame populate budget is exceeded and a populated parent quadtree node exists,
 	 * synthesize node geometry/texture via O(1) integer bilinear upsampling without stalling */
 	bool budget_exceeded = (sys->max_populates_per_frame > 0 &&
 	                        sys->frame_populates_count >= sys->max_populates_per_frame);
-	if (budget_exceeded && deferred_parent) {
+	if (budget_exceeded && parent_node) {
 		size_t idx = 0;
-		int vdim_p = (int32_t)deferred_parent->vert_dim;
-		const ar_sample_t *ps = deferred_parent->samples;
+		int vdim_p = (int32_t)parent_node->vert_dim;
+		const ar_sample_t *ps = parent_node->samples;
 		for (int r = 0; r <= gdim; r++) {
 			int r_even = ((r & 1) == 0);
 			int pr0 = parent_r_off + (r >> 1);
@@ -1557,8 +1554,11 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			float ground_h = (2.0f * dist * (is_perspective ? persp_aspect : 1.0f)) / len_row1;
 
 			if (sag_r > 0.0f && is_perspective) {
-				if (ground_w < sag_r * 2.0f) ground_w = sag_r * 2.0f;
-				if (ground_h < sag_r * 2.0f) ground_h = sag_r * 2.0f;
+				float max_sag_span = sag_r * 2.0f;
+				if (max_ray_span * 2.0f < max_sag_span)
+					max_sag_span = max_ray_span * 2.0f;
+				if (ground_w < max_sag_span) ground_w = max_sag_span;
+				if (ground_h < max_sag_span) ground_h = max_sag_span;
 			}
 
 			float half_gw = ground_w * 0.5f + margin;
