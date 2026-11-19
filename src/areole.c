@@ -967,8 +967,8 @@ void ar_system_begin_frame(ar_system_t *sys)
 	sys->frame_populates_count = 0;
 #ifdef TTYPT_WQ_H
 	if (sys->wq && sys->staging_arena) {
-		/* Cooperatively step up to 4 background chunks when running without worker threads */
-		stl_wq_step(sys->wq, 4u);
+		/* Cooperatively step up to 16 background chunks when running without worker threads */
+		stl_wq_step(sys->wq, 16u);
 		size_t vals_bytes = (size_t)sys->vert_count * sizeof(int16_t);
 		size_t rgba_bytes = (size_t)sys->vert_count * sizeof(uint32_t);
 		size_t samp_bytes = (size_t)sys->vert_count * sizeof(ar_sample_t);
@@ -1135,6 +1135,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	bool can_reuse_hierarchy = ((gdim & 1) == 0 && half_gdim > 0);
 
 	const ar_node_t *parent_node = NULL;
+	const ar_node_t *deferred_parent = NULL;
 	int parent_r_off = 0, parent_c_off = 0;
 	const ar_node_t *child_nodes[4] = { NULL, NULL, NULL, NULL };
 
@@ -1145,7 +1146,10 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			if (islet_quad_map_get(&sys->map, pkey, &pslot) &&
 			    pslot < sys->pool_capacity && sys->pool_meta[pslot].state == 1 &&
 			    sys->pool[pslot].world == world && sys->pool[pslot].level == level + 1) {
-				parent_node = &sys->pool[pslot];
+				deferred_parent = &sys->pool[pslot];
+				if ((sys->pool[pslot].flags & AR_NODE_FLAG_DEFERRED) == 0) {
+					parent_node = &sys->pool[pslot];
+				}
 				uint8_t q = morton_quad_quadrant(key);
 				parent_c_off = (q & 1) ? half_gdim : 0;
 				parent_r_off = (q & 2) ? half_gdim : 0;
@@ -1157,7 +1161,8 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 				uint32_t cslot = 0;
 				if (islet_quad_map_get(&sys->map, ckey, &cslot) &&
 				    cslot < sys->pool_capacity && sys->pool_meta[cslot].state == 1 &&
-				    sys->pool[cslot].world == world && sys->pool[cslot].level == level - 1) {
+				    sys->pool[cslot].world == world && sys->pool[cslot].level == level - 1 &&
+				    (sys->pool[cslot].flags & AR_NODE_FLAG_DEFERRED) == 0) {
 					child_nodes[q] = &sys->pool[cslot];
 				}
 			}
@@ -1172,10 +1177,10 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	 * synthesize node geometry/texture via O(1) integer bilinear upsampling without stalling */
 	bool budget_exceeded = (sys->max_populates_per_frame > 0 &&
 	                        sys->frame_populates_count >= sys->max_populates_per_frame);
-	if (budget_exceeded && parent_node) {
+	if (budget_exceeded && deferred_parent) {
 		size_t idx = 0;
-		int vdim_p = (int32_t)parent_node->vert_dim;
-		const ar_sample_t *ps = parent_node->samples;
+		int vdim_p = (int32_t)deferred_parent->vert_dim;
+		const ar_sample_t *ps = deferred_parent->samples;
 		for (int r = 0; r <= gdim; r++) {
 			int r_even = ((r & 1) == 0);
 			int pr0 = parent_r_off + (r >> 1);
@@ -1686,7 +1691,6 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			               rslot < sys->pool_capacity && sys->pool_meta[rslot].state == 1);
 			if (!cached)
 				pops_used++;
-			(void)ar_get_or_populate(sys, world, cands[k].level, cands[k].ox, cands[k].oy);
 		}
 	}
 
@@ -1782,7 +1786,19 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			continue;
 		}
 
-		if (max_pops > 0 && uncached_vis_kids > 0 && pops_used + uncached_vis_kids > max_pops) {
+		uint32_t parent_uncached = 0;
+		if (max_pops > 0) {
+			uint64_t pkey = morton_quad_key(world, cands[best_idx].level, pox, poy,
+			                                sys->base_w, sys->base_h);
+			uint32_t pslot = 0;
+			bool p_cached = (islet_quad_map_get(&sys->map, pkey, &pslot) &&
+			                 pslot < sys->pool_capacity && sys->pool_meta[pslot].state == 1);
+			if (!p_cached && pops_used > 0)
+				parent_uncached = 1;
+		}
+		uint32_t net_new_pops = (uncached_vis_kids > parent_uncached) ? (uncached_vis_kids - parent_uncached) : 0;
+
+		if (max_pops > 0 && uncached_vis_kids > 0 && pops_used + net_new_pops > max_pops) {
 			cands[best_idx].split_blocked = true;
 			continue;
 		}
@@ -1791,14 +1807,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			break;
 
 		if (max_pops > 0) {
-			/* Ensure parent is populated first so children reuse 25% of even-grid vertices */
-			(void)ar_get_or_populate(sys, world, cands[best_idx].level, pox, poy);
-			for (int c = 0; c < 4; c++) {
-				if (kids[c].visible) {
-					(void)ar_get_or_populate(sys, world, child_lvl, kids[c].ox, kids[c].oy);
-				}
-			}
-			pops_used += uncached_vis_kids;
+			pops_used += net_new_pops;
 		}
 
 		bool replaced = false;
