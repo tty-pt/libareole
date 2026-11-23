@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 #include "ttypt/morton.h"
 #include "ttypt/islet_quad.h"
@@ -157,10 +158,14 @@ void ar_mat4_lookat_lh(float out[16], const float eye[3], const float target[3],
 	out[15] = 1.0f;
 }
 
-/* 4x4 Matrix Inversion */
-bool ar_mat4_invert(float out[16], const float m[16])
+/* 4x4 Matrix Inversion (double-precision cofactors for high near/far ratios) */
+bool ar_mat4_invert(float out[16], const float mf[16])
 {
-	float inv[16];
+	double m[16];
+	for (int i = 0; i < 16; i++)
+		m[i] = (double)mf[i];
+
+	double inv[16];
 	inv[0] = m[5]  * m[10] * m[15] -
 	         m[5]  * m[11] * m[14] -
 	         m[9]  * m[6]  * m[15] +
@@ -273,15 +278,15 @@ bool ar_mat4_invert(float out[16], const float m[16])
 	          m[8] * m[1] * m[6] -
 	          m[8] * m[2] * m[5];
 
-	float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
-	if (fabsf(det) < 1e-35f || !isfinite(det)) {
+	double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+	if (fabs(det) < 1e-35 || !isfinite(det)) {
 		ar_mat4_identity(out);
 		return false;
 	}
 
-	float inv_det = 1.0f / det;
+	double inv_det = 1.0 / det;
 	for (int i = 0; i < 16; i++) {
-		out[i] = inv[i] * inv_det;
+		out[i] = (float)(inv[i] * inv_det);
 	}
 	return true;
 }
@@ -369,6 +374,368 @@ bool ar_frustum_test_box(const ar_frustum_t *frustum,
 }
 
 /* ========================================================================= */
+/* Conservative 2D Software Hi-Z Occluder (Linear Clip-Space W Depth)        */
+/* ========================================================================= */
+
+static inline void ar_occ_mark_tile_dirty(ar_occluder_t *occ, int ti)
+{
+	occ->tile_dirty[ti >> 5] |= (1u << (ti & 31));
+}
+
+static inline void ar_occ_refresh_tile(ar_occluder_t *occ, int tx, int ty)
+{
+	int ti = ty * AR_OCC_TW + tx;
+	if ((occ->tile_dirty[ti >> 5] & (1u << (ti & 31))) == 0u)
+		return;
+	int x0 = tx * AR_OCC_TILE;
+	int y0 = ty * AR_OCC_TILE;
+	int x1 = x0 + AR_OCC_TILE;
+	int y1 = y0 + AR_OCC_TILE;
+	if (x1 > AR_OCC_W) x1 = AR_OCC_W;
+	if (y1 > AR_OCC_H) y1 = AR_OCC_H;
+	float mx = 0.0f;
+	for (int y = y0; y < y1; y++) {
+		const float *row = &occ->depth[y * AR_OCC_W];
+		for (int x = x0; x < x1; x++) {
+			if (row[x] > mx) mx = row[x];
+		}
+	}
+	occ->tile_max[ti] = mx;
+	occ->tile_dirty[ti >> 5] &= ~(1u << (ti & 31));
+}
+
+void ar_occluder_reset(ar_occluder_t *occ, const float mvp[16],
+                       float near_w, float depth_bias)
+{
+	if (!occ) return;
+	if (!mvp) {
+		occ->valid = false;
+		return;
+	}
+	memcpy(occ->mvp, mvp, sizeof(occ->mvp));
+	for (int i = 0; i < AR_OCC_W * AR_OCC_H; i++)
+		occ->depth[i] = FLT_MAX;
+	for (int i = 0; i < AR_OCC_TILES; i++)
+		occ->tile_max[i] = FLT_MAX;
+	occ->tile_dirty[0] = 0u;
+	occ->tile_dirty[1] = 0u;
+	occ->tile_dirty[2] = 0u;
+	occ->near_w = (near_w > 0.0f) ? near_w : 0.5f;
+	occ->depth_bias = (depth_bias > 0.0f) ? depth_bias : 0.002f;
+	occ->culled_count = 0u;
+	occ->tested_count = 0u;
+	occ->valid = true;
+}
+
+void ar_occluder_rasterize_tri(ar_occluder_t *occ,
+                               const float p0[3], const float p1[3], const float p2[3])
+{
+	if (!occ || !occ->valid || !p0 || !p1 || !p2) return;
+	const float *m = occ->mvp;
+	const float *pts[3] = { p0, p1, p2 };
+	float sx[3], sy[3], cw[3];
+
+	for (int k = 0; k < 3; k++) {
+		float x = pts[k][0], y = pts[k][1], z = pts[k][2];
+		float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+		if (w <= occ->near_w)
+			return; /* Skip near/behind-camera triangle (strictly conservative) */
+		float cx = m[0] * x + m[4] * y + m[8]  * z + m[12];
+		float cy = m[1] * x + m[5] * y + m[9]  * z + m[13];
+		float inv_w = 1.0f / w;
+		sx[k] = (cx * inv_w * 0.5f + 0.5f) * (float)AR_OCC_W;
+		sy[k] = (cy * inv_w * 0.5f + 0.5f) * (float)AR_OCC_H;
+		cw[k] = w;
+	}
+
+	float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+	if (fabsf(area) < 1e-4f)
+		return;
+	if (area < 0.0f) {
+		float tx = sx[1]; sx[1] = sx[2]; sx[2] = tx;
+		float ty = sy[1]; sy[1] = sy[2]; sy[2] = ty;
+		float tw = cw[1]; cw[1] = cw[2]; cw[2] = tw;
+	}
+
+	float min_x = sx[0]; if (sx[1] < min_x) min_x = sx[1]; if (sx[2] < min_x) min_x = sx[2];
+	float max_x = sx[0]; if (sx[1] > max_x) max_x = sx[1]; if (sx[2] > max_x) max_x = sx[2];
+	float min_y = sy[0]; if (sy[1] < min_y) min_y = sy[1]; if (sy[2] < min_y) min_y = sy[2];
+	float max_y = sy[0]; if (sy[1] > max_y) max_y = sy[1]; if (sy[2] > max_y) max_y = sy[2];
+
+	if (max_x < 0.0f || min_x >= (float)AR_OCC_W || max_y < 0.0f || min_y >= (float)AR_OCC_H)
+		return;
+
+	int ix0 = (int)floorf(min_x);
+	int ix1 = (int)floorf(max_x);
+	int iy0 = (int)floorf(min_y);
+	int iy1 = (int)floorf(max_y);
+	if (ix0 < 0) ix0 = 0;
+	if (iy0 < 0) iy0 = 0;
+	if (ix1 >= AR_OCC_W) ix1 = AR_OCC_W - 1;
+	if (iy1 >= AR_OCC_H) iy1 = AR_OCC_H - 1;
+	if (ix0 > ix1 || iy0 > iy1)
+		return;
+
+	/* Max vertex clip-w is an exact upper bound for perspective-interpolated w on the triangle */
+	float tri_w = cw[0];
+	if (cw[1] > tri_w) tri_w = cw[1];
+	if (cw[2] > tri_w) tri_w = cw[2];
+	float w_write = tri_w * (1.0f + occ->depth_bias) + 1e-4f;
+
+	float dx01 = sx[1] - sx[0], dy01 = sy[1] - sy[0];
+	float dx12 = sx[2] - sx[1], dy12 = sy[2] - sy[1];
+	float dx20 = sx[0] - sx[2], dy20 = sy[0] - sy[2];
+
+	for (int py = iy0; py <= iy1; py++) {
+		float cy_p = (float)py + 0.5f;
+		float cx0 = (float)ix0 + 0.5f;
+		float e0 = dx01 * (cy_p - sy[0]) - dy01 * (cx0 - sx[0]);
+		float e1 = dx12 * (cy_p - sy[1]) - dy12 * (cx0 - sx[1]);
+		float e2 = dx20 * (cy_p - sy[2]) - dy20 * (cx0 - sx[2]);
+		float *row = &occ->depth[py * AR_OCC_W];
+		int ty = py / AR_OCC_TILE;
+
+		for (int px = ix0; px <= ix1; px++) {
+			if (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f) {
+				if (w_write < row[px]) {
+					row[px] = w_write;
+					ar_occ_mark_tile_dirty(occ, ty * AR_OCC_TW + (px / AR_OCC_TILE));
+				}
+			}
+			e0 -= dy01;
+			e1 -= dy12;
+			e2 -= dy20;
+		}
+	}
+}
+
+void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
+                                float value_scale, float z_bias,
+                                ar_point_3d_fn point_fn, void *point_ctx)
+{
+	if (!occ || !occ->valid || !node || !node->values || node->grid_dim == 0)
+		return;
+	if ((node->flags & (AR_NODE_FLAG_SPARSE | AR_NODE_FLAG_DEFERRED)) != 0u)
+		return;
+
+	float inv_scale = 1.0f / ((value_scale > 0.0f) ? value_scale : AR_DEFAULT_VALUE_SCALE);
+	uint32_t gd = node->grid_dim;
+	uint32_t vd = node->vert_dim;
+	uint32_t K = (gd < 8u) ? gd : 8u;
+
+	uint32_t s[9];
+	for (uint32_t c = 0; c <= K; c++)
+		s[c] = (c * gd) / K;
+
+	/* Step 1: exact minimum sample inside each coarse cell [s[gc]..s[gc+1]] x [s[gr]..s[gr+1]] */
+	int16_t cell_min[64];
+	for (uint32_t gr = 0; gr < K; gr++) {
+		for (uint32_t gc = 0; gc < K; gc++) {
+			int16_t mn = 32767;
+			for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
+				const int16_t *vrow = &node->values[vy * vd];
+				for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
+					if (vrow[vx] < mn) mn = vrow[vx];
+				}
+			}
+			cell_min[gr * K + gc] = mn;
+		}
+	}
+
+	/* Step 2: each coarse vertex takes min of all incident coarse cells,
+	 * guaranteeing the entire piecewise-linear watertight coarse mesh lies <= H(x, y) everywhere */
+	float verts[81][3];
+	float vert_wz[81];
+	float inv_gd = 1.0f / (float)gd;
+	for (uint32_t vr = 0; vr <= K; vr++) {
+		uint32_t r0 = (vr > 0u) ? (vr - 1u) : 0u;
+		uint32_t r1 = (vr < K)  ? vr : (K - 1u);
+		float wy = (float)node->oy + ((float)s[vr] * inv_gd) * (float)node->h;
+		for (uint32_t vc = 0; vc <= K; vc++) {
+			uint32_t c0 = (vc > 0u) ? (vc - 1u) : 0u;
+			uint32_t c1 = (vc < K)  ? vc : (K - 1u);
+			int16_t mn = 32767;
+			for (uint32_t gr = r0; gr <= r1; gr++) {
+				for (uint32_t gc = c0; gc <= c1; gc++) {
+					if (cell_min[gr * K + gc] < mn)
+						mn = cell_min[gr * K + gc];
+				}
+			}
+			float wx = (float)node->ox + ((float)s[vc] * inv_gd) * (float)node->w;
+			float wz = (float)mn * inv_scale - z_bias;
+			vert_wz[vr * (K + 1u) + vc] = wz;
+			float *dst = verts[vr * (K + 1u) + vc];
+			if (point_fn) {
+				point_fn(point_ctx, wx, wy, wz, dst);
+			} else {
+				dst[0] = wx;
+				dst[1] = wy;
+				dst[2] = wz;
+			}
+		}
+	}
+
+	/* Step 3: rasterize watertight K x K lowered mesh */
+	for (uint32_t gr = 0; gr < K; gr++) {
+		for (uint32_t gc = 0; gc < K; gc++) {
+			const float *v00 = verts[gr * (K + 1u) + gc];
+			const float *v10 = verts[gr * (K + 1u) + gc + 1u];
+			const float *v01 = verts[(gr + 1u) * (K + 1u) + gc];
+			const float *v11 = verts[(gr + 1u) * (K + 1u) + gc + 1u];
+			ar_occluder_rasterize_tri(occ, v00, v10, v11);
+			ar_occluder_rasterize_tri(occ, v00, v11, v01);
+		}
+	}
+
+	/* Step 4: conservative downward skirts along all 4 outer borders.
+	 * Because every boundary vertex already satisfies wz <= H(x, y) - z_bias, dropping
+	 * straight down along the seam lies strictly inside solid terrain volume {(x,y,z): z <= H(x,y)}
+	 * and seals inter-chunk elevation steps and cross-LOD T-junction cracks without false occlusion. */
+	float node_span_z = (float)(node->max_val - node->min_val) * inv_scale;
+	float max_dim = (node->w > node->h) ? (float)node->w : (float)node->h;
+	float skirt_drop = (node_span_z > 32.0f) ? node_span_z : 32.0f;
+	if (0.05f * max_dim > skirt_drop)
+		skirt_drop = 0.05f * max_dim;
+	if (skirt_drop > 512.0f)
+		skirt_drop = 512.0f;
+
+	float sk_a[3], sk_b[3];
+	/* Top (vr = 0) and Bottom (vr = K) edges */
+	for (int edge = 0; edge < 2; edge++) {
+		uint32_t vr = (edge == 0) ? 0u : K;
+		float wy = (float)node->oy + ((float)s[vr] * inv_gd) * (float)node->h;
+		for (uint32_t gc = 0; gc < K; gc++) {
+			uint32_t i0 = vr * (K + 1u) + gc;
+			uint32_t i1 = i0 + 1u;
+			float wx0 = (float)node->ox + ((float)s[gc] * inv_gd) * (float)node->w;
+			float wx1 = (float)node->ox + ((float)s[gc + 1u] * inv_gd) * (float)node->w;
+			float wz0 = vert_wz[i0] - skirt_drop;
+			float wz1 = vert_wz[i1] - skirt_drop;
+			if (point_fn) {
+				point_fn(point_ctx, wx0, wy, wz0, sk_a);
+				point_fn(point_ctx, wx1, wy, wz1, sk_b);
+			} else {
+				sk_a[0] = wx0; sk_a[1] = wy; sk_a[2] = wz0;
+				sk_b[0] = wx1; sk_b[1] = wy; sk_b[2] = wz1;
+			}
+			ar_occluder_rasterize_tri(occ, verts[i0], verts[i1], sk_b);
+			ar_occluder_rasterize_tri(occ, verts[i0], sk_b, sk_a);
+		}
+	}
+	/* Left (vc = 0) and Right (vc = K) edges */
+	for (int edge = 0; edge < 2; edge++) {
+		uint32_t vc = (edge == 0) ? 0u : K;
+		float wx = (float)node->ox + ((float)s[vc] * inv_gd) * (float)node->w;
+		for (uint32_t gr = 0; gr < K; gr++) {
+			uint32_t i0 = gr * (K + 1u) + vc;
+			uint32_t i1 = (gr + 1u) * (K + 1u) + vc;
+			float wy0 = (float)node->oy + ((float)s[gr] * inv_gd) * (float)node->h;
+			float wy1 = (float)node->oy + ((float)s[gr + 1u] * inv_gd) * (float)node->h;
+			float wz0 = vert_wz[i0] - skirt_drop;
+			float wz1 = vert_wz[i1] - skirt_drop;
+			if (point_fn) {
+				point_fn(point_ctx, wx, wy0, wz0, sk_a);
+				point_fn(point_ctx, wx, wy1, wz1, sk_b);
+			} else {
+				sk_a[0] = wx; sk_a[1] = wy0; sk_a[2] = wz0;
+				sk_b[0] = wx; sk_b[1] = wy1; sk_b[2] = wz1;
+			}
+			ar_occluder_rasterize_tri(occ, verts[i0], verts[i1], sk_b);
+			ar_occluder_rasterize_tri(occ, verts[i0], sk_b, sk_a);
+		}
+	}
+}
+
+bool ar_occluder_test_box(ar_occluder_t *occ,
+                          const float b_min[3], const float b_max[3])
+{
+	if (!occ || !occ->valid || !b_min || !b_max)
+		return false;
+
+	occ->tested_count++;
+	const float *m = occ->mvp;
+	float min_nx =  1e30f, max_nx = -1e30f;
+	float min_ny =  1e30f, max_ny = -1e30f;
+	float min_w  =  FLT_MAX;
+
+	for (int c = 0; c < 8; c++) {
+		float x = (c & 1) ? b_max[0] : b_min[0];
+		float y = (c & 2) ? b_max[1] : b_min[1];
+		float z = (c & 4) ? b_max[2] : b_min[2];
+		float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+		if (w <= occ->near_w)
+			return false; /* Straddling or behind near plane -> never occluded */
+		float cx = m[0] * x + m[4] * y + m[8]  * z + m[12];
+		float cy = m[1] * x + m[5] * y + m[9]  * z + m[13];
+		float inv_w = 1.0f / w;
+		float nx = cx * inv_w;
+		float ny = cy * inv_w;
+		if (nx < min_nx) min_nx = nx;
+		if (nx > max_nx) max_nx = nx;
+		if (ny < min_ny) min_ny = ny;
+		if (ny > max_ny) max_ny = ny;
+		if (w  < min_w)  min_w  = w;
+	}
+
+	float min_px = (min_nx * 0.5f + 0.5f) * (float)AR_OCC_W;
+	float max_px = (max_nx * 0.5f + 0.5f) * (float)AR_OCC_W;
+	float min_py = (min_ny * 0.5f + 0.5f) * (float)AR_OCC_H;
+	float max_py = (max_ny * 0.5f + 0.5f) * (float)AR_OCC_H;
+
+	/* Outer-conservative 1-pixel expansion on all 4 sides (zero silhouette leaks) */
+	int x0 = (int)floorf(min_px) - 1;
+	int x1 = (int)ceilf(max_px) + 1;
+	int y0 = (int)floorf(min_py) - 1;
+	int y1 = (int)ceilf(max_py) + 1;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 >= AR_OCC_W) x1 = AR_OCC_W - 1;
+	if (y1 >= AR_OCC_H) y1 = AR_OCC_H - 1;
+	if (x0 > x1 || y0 > y1)
+		return false;
+
+	int tx0 = x0 / AR_OCC_TILE;
+	int tx1 = x1 / AR_OCC_TILE;
+	int ty0 = y0 / AR_OCC_TILE;
+	int ty1 = y1 / AR_OCC_TILE;
+
+	for (int ty = ty0; ty <= ty1; ty++) {
+		int tpy0 = ty * AR_OCC_TILE;
+		int tpy1 = tpy0 + AR_OCC_TILE - 1;
+		if (tpy1 >= AR_OCC_H) tpy1 = AR_OCC_H - 1;
+		for (int tx = tx0; tx <= tx1; tx++) {
+			ar_occ_refresh_tile(occ, tx, ty);
+			float tmax = occ->tile_max[ty * AR_OCC_TW + tx];
+			if (tmax < min_w)
+				continue; /* Entire 8x8 tile is strictly nearer than box */
+
+			int tpx0 = tx * AR_OCC_TILE;
+			int tpx1 = tpx0 + AR_OCC_TILE - 1;
+			if (tpx1 >= AR_OCC_W) tpx1 = AR_OCC_W - 1;
+
+			/* If query rect covers the entire tile, tmax >= min_w proves at least one pixel is visible */
+			if (tpx0 >= x0 && tpx1 <= x1 && tpy0 >= y0 && tpy1 <= y1)
+				return false;
+
+			int sx0 = (x0 > tpx0) ? x0 : tpx0;
+			int sx1 = (x1 < tpx1) ? x1 : tpx1;
+			int sy0 = (y0 > tpy0) ? y0 : tpy0;
+			int sy1 = (y1 < tpy1) ? y1 : tpy1;
+			for (int py = sy0; py <= sy1; py++) {
+				const float *row = &occ->depth[py * AR_OCC_W];
+				for (int px = sx0; px <= sx1; px++) {
+					if (row[px] >= min_w)
+						return false;
+				}
+			}
+		}
+	}
+
+	occ->culled_count++;
+	return true;
+}
+
+/* ========================================================================= */
 /* Vertical Bounds Envelope & Screen Projection Helpers                      */
 /* ========================================================================= */
 
@@ -377,17 +744,13 @@ static inline void ar_compute_bounds_envelope(const ar_system_t *sys,
                                               float ox, float oy, float w, float h,
                                               float *out_z_min, float *out_z_max);
 
-static inline float ar_projected_screen_width_3d(const float mvp[16],
-                                                  const ar_cull_opts_t *opts,
-                                                  const float center_xyz[3],
-                                                  float span_w, float span_h,
-                                                  float vp_w, float vp_h)
+static inline float ar_projected_screen_width_box_3d(const float mvp[16],
+                                                     const ar_cull_opts_t *opts,
+                                                     const float center_xyz[3],
+                                                     const float eye_xyz[3], bool has_eye,
+                                                     float span_w, float span_h,
+                                                     float vp_w, float vp_h)
 {
-	float cw = mvp[0 * 4 + 3] * center_xyz[0] +
-	           mvp[1 * 4 + 3] * center_xyz[1] +
-	           mvp[2 * 4 + 3] * center_xyz[2] +
-	           mvp[3 * 4 + 3] * 1.0f;
-
 	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
 
 	float len_row0 = sqrtf(mvp[0]*mvp[0] + mvp[4]*mvp[4] + mvp[8]*mvp[8]);
@@ -397,28 +760,28 @@ static inline float ar_projected_screen_width_3d(const float mvp[16],
 
 	float w_eff = 1.0f;
 	if (is_perspective) {
+		float cw = mvp[3] * center_xyz[0] +
+		           mvp[7] * center_xyz[1] +
+		           mvp[11] * center_xyz[2] +
+		           mvp[15];
 		float clip_w_thresh = (opts && opts->behind_cam_clip_w > 0.0f)
 		                      ? opts->behind_cam_clip_w : AR_DEFAULT_BEHIND_CAM_CLIP_W;
-		float screen_mult = (opts && opts->behind_cam_screen_mult > 0.0f)
-		                    ? opts->behind_cam_screen_mult : AR_DEFAULT_BEHIND_CAM_SCREEN_MULT;
-		if (cw <= clip_w_thresh) return (vp_w > vp_h ? vp_w : vp_h) * screen_mult;
-		w_eff = cw;
+		if (has_eye) {
+			float dx = center_xyz[0] - eye_xyz[0];
+			float dy = center_xyz[1] - eye_xyz[1];
+			float dz = center_xyz[2] - eye_xyz[2];
+			float len_row3 = sqrtf(mvp[3]*mvp[3] + mvp[7]*mvp[7] + mvp[11]*mvp[11]);
+			float d_center = sqrtf(dx * dx + dy * dy + dz * dz) * len_row3;
+			w_eff = (d_center > clip_w_thresh) ? d_center : clip_w_thresh;
+		} else {
+			w_eff = (cw > clip_w_thresh) ? cw : clip_w_thresh;
+		}
 	}
 
 	float px_w = (span_w * len_row0 * vp_w * 0.5f) / w_eff;
 	float px_h = (span_h * len_row1 * vp_h * 0.5f) / w_eff;
 
 	return (px_w > px_h) ? px_w : px_h;
-}
-
-static inline float ar_projected_screen_width(const float mvp[16],
-                                              const ar_cull_opts_t *opts,
-                                              float ox, float oy, float w, float h,
-                                              float z_mid,
-                                              float vp_w, float vp_h)
-{
-	float center_xyz[3] = { ox + w * 0.5f, oy + h * 0.5f, z_mid };
-	return ar_projected_screen_width_3d(mvp, opts, center_xyz, w, h, vp_w, vp_h);
 }
 
 /* ========================================================================= */
@@ -430,6 +793,8 @@ typedef struct {
 	uint8_t level;
 	float   proj_w;
 	float   dist_sq;
+	float   b_min[3];
+	float   b_max[3];
 	bool    active;
 	bool    split_blocked;
 } ar_candidate_t;
@@ -570,14 +935,49 @@ static inline void ar_compute_bounds_envelope(const ar_system_t *sys,
 	*out_z_max = z_max + margin;
 }
 
+static inline void ar_apply_cached_z_bounds(const ar_system_t *sys,
+                                            const ar_cull_opts_t *opts,
+                                            uint16_t world, uint8_t level,
+                                            int32_t ox, int32_t oy,
+                                            float *inout_z_min, float *inout_z_max)
+{
+	if (!opts || !opts->use_cached_bounds || level > opts->cached_bounds_max_level)
+		return;
+	uint64_t key = morton_quad_key(world, level, ox, oy, sys->base_w, sys->base_h);
+	uint32_t slot = 0;
+	if (!islet_quad_map_get(&sys->map, key, &slot) || slot >= sys->pool_capacity)
+		return;
+	if (sys->pool_meta[slot].state != 1)
+		return;
+	const ar_node_t *node = &sys->pool[slot];
+	if ((node->flags & AR_NODE_FLAG_DEFERRED) != 0u)
+		return;
+	float inv_s = 1.0f / sys->value_scale;
+	float cz_min = (float)node->min_val * inv_s - opts->cached_bounds_pad;
+	float cz_max = (float)node->max_val * inv_s + opts->cached_bounds_pad;
+	if (cz_min > *inout_z_min) *inout_z_min = cz_min;
+	if (cz_max < *inout_z_max) *inout_z_max = cz_max;
+	if (*inout_z_min > *inout_z_max) {
+		float mid = 0.5f * (*inout_z_min + *inout_z_max);
+		*inout_z_min = mid;
+		*inout_z_max = mid;
+	}
+}
+
 static inline void ar_compute_node_3d_box(const ar_system_t *sys,
                                           const ar_cull_opts_t *opts,
-                                          float ox, float oy, float w, float h,
+                                          uint16_t world, uint8_t level,
+                                          int32_t iox, int32_t ioy,
+                                          int32_t iw, int32_t ih,
+                                          const float eye_xyz[3], bool has_eye,
                                           float out_min[3], float out_max[3],
                                           float out_center[3],
                                           float *out_span_w, float *out_span_h,
-                                          float *out_dist_sq)
+                                          float *out_dist_sq,
+                                          float *out_z_min, float *out_z_max)
 {
+	float ox = (float)iox, oy = (float)ioy;
+	float w  = (float)iw,  h  = (float)ih;
 	ar_bounds_3d_fn b3d = (opts && opts->bounds_3d_fn) ? opts->bounds_3d_fn : sys->bounds_3d_fn;
 	void *b_ctx = (opts && (opts->bounds_3d_fn || opts->bounds_fn)) ? opts->bounds_ctx : sys->bounds_ctx;
 
@@ -585,45 +985,76 @@ static inline void ar_compute_node_3d_box(const ar_system_t *sys,
 		float z_min = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_min : sys->z_min;
 		float z_max = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_max : sys->z_max;
 		float margin = (opts && opts->margin > 0.0f) ? opts->margin : sys->margin;
+		ar_apply_cached_z_bounds(sys, opts, world, level, iox, ioy, &z_min, &z_max);
+		float eff_z_min = z_min - margin;
+		float eff_z_max = z_max + margin;
 		float sw = w, sh = h;
-		b3d(b_ctx, ox, oy, w, h, z_min - margin, z_max + margin,
+		b3d(b_ctx, ox, oy, w, h, eff_z_min, eff_z_max,
 		    out_min, out_max, out_center, &sw, &sh);
 		*out_span_w = (sw > 0.0f) ? sw : w;
 		*out_span_h = (sh > 0.0f) ? sh : h;
-		/* Distance squared to 3D AABB from origin (0,0,0) in camera-relative / MVP space */
+		if (out_z_min) *out_z_min = eff_z_min;
+		if (out_z_max) *out_z_max = eff_z_max;
+
+		/* Distance squared from true camera eye (or origin if unavailable) to 3D AABB */
+		float ex = has_eye ? eye_xyz[0] : 0.0f;
+		float ey = has_eye ? eye_xyz[1] : 0.0f;
+		float ez = has_eye ? eye_xyz[2] : 0.0f;
 		float d2 = 0.0f;
-		for (int k = 0; k < 3; k++) {
-			float d = 0.0f;
-			if (0.0f < out_min[k]) d = out_min[k];
-			else if (0.0f > out_max[k]) d = -out_max[k];
-			d2 += d * d;
-		}
+		float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+		if (ex < out_min[0]) dx = out_min[0] - ex; else if (ex > out_max[0]) dx = ex - out_max[0];
+		if (ey < out_min[1]) dy = out_min[1] - ey; else if (ey > out_max[1]) dy = ey - out_max[1];
+		if (ez < out_min[2]) dz = out_min[2] - ez; else if (ez > out_max[2]) dz = ez - out_max[2];
+		d2 = dx * dx + dy * dy + dz * dz;
 		*out_dist_sq = d2;
 		return;
 	}
 
 	float node_z_min, node_z_max;
 	ar_compute_bounds_envelope(sys, opts, ox, oy, w, h, &node_z_min, &node_z_max);
+	if (opts && opts->use_cached_bounds && level <= opts->cached_bounds_max_level) {
+		float margin = (opts->margin > 0.0f) ? opts->margin : sys->margin;
+		float z0 = node_z_min + margin;
+		float z1 = node_z_max - margin;
+		ar_apply_cached_z_bounds(sys, opts, world, level, iox, ioy, &z0, &z1);
+		node_z_min = z0 - margin;
+		node_z_max = z1 + margin;
+	}
 	out_min[0] = ox;
 	out_min[1] = oy;
 	out_min[2] = node_z_min;
 	out_max[0] = ox + w;
 	out_max[1] = oy + h;
 	out_max[2] = node_z_max;
+	float cz = opts ? opts->focal_z : (node_z_min + node_z_max) * 0.5f;
+	if (cz < node_z_min) cz = node_z_min;
+	if (cz > node_z_max) cz = node_z_max;
 	out_center[0] = ox + w * 0.5f;
 	out_center[1] = oy + h * 0.5f;
-	out_center[2] = (node_z_min + node_z_max) * 0.5f;
+	out_center[2] = cz;
 	*out_span_w = w;
 	*out_span_h = h;
+	if (out_z_min) *out_z_min = node_z_min;
+	if (out_z_max) *out_z_max = node_z_max;
 
-	float fx = opts ? opts->focal_x : 0.0f;
-	float fy = opts ? opts->focal_y : 0.0f;
-	float dx = 0.0f, dy = 0.0f;
-	if (fx < ox) dx = ox - fx;
-	else if (fx > ox + w) dx = fx - (ox + w);
-	if (fy < oy) dy = oy - fy;
-	else if (fy > oy + h) dy = fy - (oy + h);
-	*out_dist_sq = dx * dx + dy * dy;
+	if (has_eye) {
+		float dx = 0.0f, dy = 0.0f;
+		if (eye_xyz[0] < out_min[0]) dx = out_min[0] - eye_xyz[0];
+		else if (eye_xyz[0] > out_max[0]) dx = eye_xyz[0] - out_max[0];
+		if (eye_xyz[1] < out_min[1]) dy = out_min[1] - eye_xyz[1];
+		else if (eye_xyz[1] > out_max[1]) dy = eye_xyz[1] - out_max[1];
+		float dz = eye_xyz[2] - cz;
+		*out_dist_sq = dx * dx + dy * dy + dz * dz;
+	} else {
+		float fx = opts ? opts->focal_x : 0.0f;
+		float fy = opts ? opts->focal_y : 0.0f;
+		float dx = 0.0f, dy = 0.0f;
+		if (fx < ox) dx = ox - fx;
+		else if (fx > ox + w) dx = fx - (ox + w);
+		if (fy < oy) dy = oy - fy;
+		else if (fy > oy + h) dy = fy - (oy + h);
+		*out_dist_sq = dx * dx + dy * dy;
+	}
 }
 
 static inline size_t ar_align8(size_t n)
@@ -1356,6 +1787,45 @@ static inline bool ar_unproject_ndc(const float inv_mvp[16], float ndc_x, float 
 	return true;
 }
 
+static inline int32_t ar_floor_i32(float v)
+{
+	if (v < -1e9f) return -1000000000;
+	if (v >  1e9f) return  1000000000;
+	return (int32_t)floorf(v);
+}
+
+static inline bool ar_occ_test_padded(ar_occluder_t *occ,
+                                      const float b_min[3], const float b_max[3],
+                                      float pad, bool pad_all_axes)
+{
+	if (!occ || !occ->valid)
+		return false;
+	if (pad <= 0.0f)
+		return ar_occluder_test_box(occ, b_min, b_max);
+	float pmin[3] = { b_min[0] - (pad_all_axes ? pad : 0.0f),
+	                  b_min[1] - (pad_all_axes ? pad : 0.0f),
+	                  b_min[2] - pad };
+	float pmax[3] = { b_max[0] + (pad_all_axes ? pad : 0.0f),
+	                  b_max[1] + (pad_all_axes ? pad : 0.0f),
+	                  b_max[2] + pad };
+	return ar_occluder_test_box(occ, pmin, pmax);
+}
+
+static inline bool ar_frustum_test_box_sat(const ar_frustum_t *f,
+                                           bool has_faabb,
+                                           const float f_min[3], const float f_max[3],
+                                           const float b_min[3], const float b_max[3])
+{
+	if (has_faabb) {
+		if (b_max[0] < f_min[0] || b_min[0] > f_max[0] ||
+		    b_max[1] < f_min[1] || b_min[1] > f_max[1] ||
+		    b_max[2] < f_min[2] || b_min[2] > f_max[2])
+			return false;
+	}
+	return ar_frustum_test_box(f, b_min[0], b_min[1], b_min[2],
+	                           b_max[0], b_max[1], b_max[2]);
+}
+
 size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
                               const float mvp[16],
                               const ar_cull_opts_t *opts,
@@ -1373,15 +1843,17 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	ar_frustum_t frustum;
 	ar_frustum_from_matrix(&frustum, mvp);
 
-	/* 2. Analytical Inversion for Viewport Ray Unprojection */
+	/* 2. Analytical Inversion for Viewport Ray Unprojection & Camera Eye Extraction */
 	float inv_mvp[16];
 	bool has_inv = ar_mat4_invert(inv_mvp, mvp);
 
-	/* 3. Determine root footprint bounds */
+	/* 3. Determine camera eye & root footprint bounds */
 	float fx = opts ? opts->focal_x : 0.0f;
 	float fy = opts ? opts->focal_y : 0.0f;
 	float fz = opts ? opts->focal_z : 0.0f;
 	float sag_r = (opts && opts->sag_radius > 0.0f) ? opts->sag_radius : sys->sag_radius;
+	float sag_slope = (opts && opts->sag_tangent_slope > 0.0f) ? opts->sag_tangent_slope : sys->sag_tangent_slope;
+	if (sag_slope <= 0.0f) sag_slope = AR_DEFAULT_SAG_TANGENT_SLOPE;
 	float margin = (opts && opts->margin > 0.0f) ? opts->margin : sys->margin;
 	float vp_w = (opts && opts->viewport_w > 0.0f) ? opts->viewport_w : sys->default_viewport_w;
 	float vp_h = (opts && opts->viewport_h > 0.0f) ? opts->viewport_h : sys->default_viewport_h;
@@ -1389,15 +1861,30 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	                         ? (int64_t)opts->max_root_cells
 	                         : (int64_t)((sys->max_root_cells > 0) ? sys->max_root_cells : AR_DEFAULT_MAX_ROOT_CELLS);
 
-	float reach_mult = (opts && opts->horizon_reach_mult > 0.0f) ? opts->horizon_reach_mult : AR_DEFAULT_HORIZON_REACH_MULT;
 	float ray_span_mult = (opts && opts->max_ray_span_mult > 0.0f) ? opts->max_ray_span_mult : AR_DEFAULT_MAX_RAY_SPAN_MULT;
-	float z_low_mult = (opts && opts->persp_z_low_mult > 0.0f) ? opts->persp_z_low_mult : AR_DEFAULT_PERSP_Z_LOW_MULT;
-	float z_high_mult = (opts && opts->persp_z_high_mult > 0.0f) ? opts->persp_z_high_mult : AR_DEFAULT_PERSP_Z_HIGH_MULT;
 	float coord_bound = (opts && opts->max_coord_bound > 0.0f) ? opts->max_coord_bound : AR_DEFAULT_MAX_COORD_BOUND;
 
 	float z_min = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_min : sys->z_min;
 	float z_max = (opts && (opts->z_min != 0.0f || opts->z_max != 0.0f)) ? opts->z_max : sys->z_max;
 	bool is_perspective = (fabsf(mvp[3]) > 1e-5f || fabsf(mvp[7]) > 1e-5f || fabsf(mvp[11]) > 1e-5f);
+
+	/* Extract true camera eye position in MVP world space:
+	 * For any perspective P*V, P*(0,0,0,1)^T = (0,0,P[14],0)^T -> eye = inv_mvp.col2 / inv_mvp[11]. */
+	float eye_xyz[3] = { fx, fy, fz };
+	bool has_eye = false;
+	if (is_perspective && has_inv && fabsf(inv_mvp[11]) > 1e-12f) {
+		float inv_ew = 1.0f / inv_mvp[11];
+		float ex = inv_mvp[8]  * inv_ew;
+		float ey = inv_mvp[9]  * inv_ew;
+		float ez = inv_mvp[10] * inv_ew;
+		if (isfinite(ex) && isfinite(ey) && isfinite(ez)) {
+			eye_xyz[0] = ex;
+			eye_xyz[1] = ey;
+			eye_xyz[2] = ez;
+			has_eye = true;
+		}
+	}
+
 	float focal_pt[4] = { fx, fy, fz, 1.0f };
 	float focal_clip[4];
 	for (int i = 0; i < 4; i++) {
@@ -1407,15 +1894,6 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		               mvp[3 * 4 + i] * focal_pt[3];
 	}
 	float dist = (is_perspective && focal_clip[3] > 0.01f) ? fabsf(focal_clip[3]) : 1.0f;
-
-	float eff_z_min = z_min;
-	if (sag_r > 0.0f) {
-		float reach = dist * reach_mult;
-		float sag_est = (reach * reach) / (2.0f * sag_r);
-		float max_sag = is_perspective ? ((sag_est < sag_r) ? sag_est : sag_r) : sag_r;
-		eff_z_min -= max_sag;
-	}
-	float eff_z_max = z_max;
 	float z_span = fabsf(z_max - z_min);
 	float max_ray_span = is_perspective ? ((dist * ray_span_mult > z_span) ? (dist * ray_span_mult) : z_span) : coord_bound;
 
@@ -1425,10 +1903,44 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	if (len_row1 < 1e-7f) len_row1 = 0.001f;
 
 	ar_bounds_3d_fn b3d = (opts && opts->bounds_3d_fn) ? opts->bounds_3d_fn : sys->bounds_3d_fn;
+	ar_bounds_fn b_fn = (opts && opts->bounds_fn) ? opts->bounds_fn : sys->bounds_fn;
 
-	float bb_min_x = 1e9f, bb_max_x = -1e9f;
-	float bb_min_y = 1e9f, bb_max_y = -1e9f;
+	float bb_min_x = 1e30f, bb_max_x = -1e30f;
+	float bb_min_y = 1e30f, bb_max_y = -1e30f;
 	size_t unproj_pts = 0;
+	bool frustum_misses_slab = false;
+
+	/* Unproject all 8 NDC frustum corners once to build exact frustum AABB (SAT culling)
+	 * and exact Frustum intersect Slab footprint for flat worlds. */
+	float fc[8][3];
+	float faabb_min[3] = {  1e30f,  1e30f,  1e30f };
+	float faabb_max[3] = { -1e30f, -1e30f, -1e30f };
+	bool has_faabb = false;
+	if (has_inv) {
+		int ok_cnt = 0;
+		for (int k = 0; k < 8; k++) {
+			float nx = (k & 1) ? 1.0f : -1.0f;
+			float ny = (k & 2) ? 1.0f : -1.0f;
+			float nz = (k & 4) ? 1.0f : -1.0f;
+			if (ar_unproject_ndc(inv_mvp, nx, ny, nz, fc[k]) &&
+			    isfinite(fc[k][0]) && isfinite(fc[k][1]) && isfinite(fc[k][2])) {
+				for (int a = 0; a < 3; a++) {
+					if (fc[k][a] < faabb_min[a]) faabb_min[a] = fc[k][a];
+					if (fc[k][a] > faabb_max[a]) faabb_max[a] = fc[k][a];
+				}
+				ok_cnt++;
+			}
+		}
+		if (ok_cnt == 8) {
+			for (int a = 0; a < 3; a++) {
+				float eps_lo = 1e-5f * fabsf(faabb_min[a]) + 1e-2f;
+				float eps_hi = 1e-5f * fabsf(faabb_max[a]) + 1e-2f;
+				faabb_min[a] -= eps_lo;
+				faabb_max[a] += eps_hi;
+			}
+			has_faabb = true;
+		}
+	}
 
 	if (b3d) {
 		uint8_t top_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
@@ -1444,6 +1956,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		bb_min_y = fy - half_gh;
 		bb_max_y = fy + half_gh;
 	} else {
+		bool all_8_ok = has_faabb;
 		if (has_inv) {
 			if (!opts) {
 				float c_near[3], c_far[3];
@@ -1461,70 +1974,87 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				}
 			}
 
-			const float ndc_corners[4][2] = {
-				{ -1.0f, -1.0f },
-				{  1.0f, -1.0f },
-				{  1.0f,  1.0f },
-				{ -1.0f,  1.0f }
-			};
+			/* Exact convex Frustum intersect Slab [slab_z_min, slab_z_max]:
+			 * Clip the 12 frustum edges against the slab planes. */
+			if (all_8_ok) {
+				float slab_z_min = z_min - margin;
+				float slab_z_max = z_max + margin;
 
-			for (int k = 0; k < 4; k++) {
-				float p_near[3], p_far[3];
-				bool far_is_mid = false;
-				if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1], -1.0f, p_near))
-					continue;
-				if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1],  1.0f, p_far)) {
-					if (!ar_unproject_ndc(inv_mvp, ndc_corners[k][0], ndc_corners[k][1], 0.0f, p_far))
-						continue;
-					far_is_mid = true;
+				if (sag_r > 0.0f) {
+					/* Compute conservative sag lower bound across actual frustum reach */
+					float max_r2 = 0.0f;
+					for (int k = 0; k < 8; k++) {
+						float dx = fc[k][0] - fx;
+						float dy = fc[k][1] - fy;
+						float r2 = dx * dx + dy * dy;
+						if (r2 > max_r2) max_r2 = r2;
+					}
+					float r_far = sqrtf(max_r2);
+					if (r_far > coord_bound) r_far = coord_bound;
+					float delta_sag;
+					if (r_far < sag_r) {
+						float diff = sag_r * sag_r - r_far * r_far;
+						if (diff < 1.0f) diff = 1.0f;
+						delta_sag = sag_r - sqrtf(diff);
+					} else {
+						delta_sag = sag_r + (r_far - sag_r) * sag_slope;
+					}
+					slab_z_min -= delta_sag;
 				}
 
-				float dx = p_far[0] - p_near[0];
-				float dy = p_far[1] - p_near[1];
-				float dz = p_far[2] - p_near[2];
+				for (int k = 0; k < 8; k++) {
+					if (fc[k][2] >= slab_z_min && fc[k][2] <= slab_z_max) {
+						float ix = fc[k][0];
+						float iy = fc[k][1];
+						if (ix < -coord_bound) ix = -coord_bound;
+						if (ix >  coord_bound) ix =  coord_bound;
+						if (iy < -coord_bound) iy = -coord_bound;
+						if (iy >  coord_bound) iy =  coord_bound;
+						if (ix < bb_min_x) bb_min_x = ix;
+						if (ix > bb_max_x) bb_max_x = ix;
+						if (iy < bb_min_y) bb_min_y = iy;
+						if (iy > bb_max_y) bb_max_y = iy;
+						unproj_pts++;
+					}
+				}
 
-				if (fabsf(dz) > 1e-6f) {
-					float z_mid = (eff_z_min + eff_z_max) * 0.5f;
-					float z_ground = fz;
-					if (z_ground < eff_z_min) z_ground = eff_z_min;
-					if (z_ground > eff_z_max) z_ground = eff_z_max;
-					float z_low  = is_perspective ? fmaxf(eff_z_min, z_ground - dist * z_low_mult) : eff_z_min;
-					float z_high = is_perspective ? fminf(eff_z_max, z_ground + dist * z_high_mult) : eff_z_max;
-					const float test_planes[4] = { z_ground, z_mid, z_low, z_high };
-					float ortho_t_min = (opts && opts->ortho_ray_t_min != 0.0f)
-					                    ? opts->ortho_ray_t_min : AR_DEFAULT_ORTHO_RAY_T_MIN;
-					float unit_t_max = (opts && opts->unit_ray_t_max > 0.0f)
-					                   ? opts->unit_ray_t_max : AR_DEFAULT_UNIT_RAY_T_MAX;
-					float far_mid_t_max = (opts && opts->far_mid_ray_t_max > 0.0f)
-					                      ? opts->far_mid_ray_t_max : AR_DEFAULT_FAR_MID_RAY_T_MAX;
-					float t_min = is_perspective ? 0.0f : ortho_t_min;
-					float t_max = far_is_mid ? far_mid_t_max : unit_t_max;
-					for (int p = 0; p < 4; p++) {
-						float t = (test_planes[p] - p_near[2]) / dz;
-						if (t >= t_min && t <= t_max) {
-							float ix = p_near[0] + t * dx;
-							float iy = p_near[1] + t * dy;
-							if (is_perspective) {
-								if (ix < fx - max_ray_span) ix = fx - max_ray_span;
-								if (ix > fx + max_ray_span) ix = fx + max_ray_span;
-								if (iy < fy - max_ray_span) iy = fy - max_ray_span;
-								if (iy > fy + max_ray_span) iy = fy + max_ray_span;
-							}
-							if (ix >= -coord_bound && ix <= coord_bound &&
-							    iy >= -coord_bound && iy <= coord_bound) {
-								if (ix < bb_min_x) bb_min_x = ix;
-								if (ix > bb_max_x) bb_max_x = ix;
-								if (iy < bb_min_y) bb_min_y = iy;
-								if (iy > bb_max_y) bb_max_y = iy;
-								unproj_pts++;
-							}
+				static const uint8_t edges[12][2] = {
+					{0, 1}, {1, 3}, {3, 2}, {2, 0}, /* Near face */
+					{4, 5}, {5, 7}, {7, 6}, {6, 4}, /* Far face */
+					{0, 4}, {1, 5}, {2, 6}, {3, 7}  /* Side edges */
+				};
+				const float slab_planes[2] = { slab_z_min, slab_z_max };
+
+				for (int e = 0; e < 12; e++) {
+					const float *pa = fc[edges[e][0]];
+					const float *pb = fc[edges[e][1]];
+					float za = pa[2], zb = pb[2];
+					float dz = zb - za;
+					if (fabsf(dz) <= 1e-6f) continue;
+					for (int p = 0; p < 2; p++) {
+						float pz = slab_planes[p];
+						if ((za - pz) * (zb - pz) <= 0.0f) {
+							float t = (pz - za) / dz;
+							if (t < 0.0f) t = 0.0f;
+							if (t > 1.0f) t = 1.0f;
+							float ix = pa[0] + t * (pb[0] - pa[0]);
+							float iy = pa[1] + t * (pb[1] - pa[1]);
+							if (ix < -coord_bound) ix = -coord_bound;
+							if (ix >  coord_bound) ix =  coord_bound;
+							if (iy < -coord_bound) iy = -coord_bound;
+							if (iy >  coord_bound) iy =  coord_bound;
+							if (ix < bb_min_x) bb_min_x = ix;
+							if (ix > bb_max_x) bb_max_x = ix;
+							if (iy < bb_min_y) bb_min_y = iy;
+							if (iy > bb_max_y) bb_max_y = iy;
+							unproj_pts++;
 						}
 					}
 				}
 			}
 		}
 
-		if (unproj_pts >= 2 && bb_max_x > bb_min_x && bb_max_y > bb_min_y) {
+		if (unproj_pts >= 2 && bb_max_x >= bb_min_x && bb_max_y >= bb_min_y) {
 			bb_min_x -= margin;
 			bb_max_x += margin;
 			bb_min_y -= margin;
@@ -1535,6 +2065,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 					fy = (bb_min_y + bb_max_y) * 0.5f;
 				}
 			}
+		} else if (all_8_ok && unproj_pts == 0 && !b_fn) {
+			/* Frustum lies completely outside the terrain Z slab (e.g. looking straight into sky) */
+			frustum_misses_slab = true;
 		} else {
 			float persp_aspect = (opts && opts->fallback_persp_aspect > 0.0f)
 			                     ? opts->fallback_persp_aspect : AR_DEFAULT_FALLBACK_PERSP_ASPECT;
@@ -1559,71 +2092,9 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 	}
 
-	/* 4. Determine root level that naturally covers the bounding box (cols * rows <= max_root_cells) */
-	uint8_t root_level = 0;
-	while (root_level + 1 < sys->max_levels) {
-		int32_t rw = sys->base_w << root_level;
-		int32_t rh = sys->base_h << root_level;
-		int32_t gi0 = morton_fdiv((int32_t)bb_min_x, rw);
-		int32_t gi1 = morton_fdiv((int32_t)bb_max_x, rw);
-		int32_t gj0 = morton_fdiv((int32_t)bb_min_y, rh);
-		int32_t gj1 = morton_fdiv((int32_t)bb_max_y, rh);
-		int64_t cols = (int64_t)gi1 - gi0 + 1;
-		int64_t rows = (int64_t)gj1 - gj0 + 1;
-		if (cols > 0 && rows > 0 && cols * rows <= max_root_cells)
-			break;
-		root_level++;
-	}
-
-	if (opts && opts->min_level > 0 && root_level < opts->min_level)
-		root_level = opts->min_level;
-	if (opts && opts->max_level > 0 && root_level > opts->max_level)
-		root_level = opts->max_level;
-
-	int32_t root_w = sys->base_w << root_level;
-	int32_t root_h = sys->base_h << root_level;
-
-	int32_t i0 = morton_fdiv((int32_t)bb_min_x, root_w);
-	int32_t i1 = morton_fdiv((int32_t)bb_max_x, root_w);
-	int32_t j0 = morton_fdiv((int32_t)bb_min_y, root_h);
-	int32_t j1 = morton_fdiv((int32_t)bb_max_y, root_h);
-
-	uint8_t eff_max_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
-		? opts->max_level : (uint8_t)(sys->max_levels - 1);
-	while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > max_root_cells &&
-	       root_level < eff_max_lvl) {
-		root_level++;
-		root_w = sys->base_w << root_level;
-		root_h = sys->base_h << root_level;
-		i0 = morton_fdiv((int32_t)bb_min_x, root_w);
-		i1 = morton_fdiv((int32_t)bb_max_x, root_w);
-		j0 = morton_fdiv((int32_t)bb_min_y, root_h);
-		j1 = morton_fdiv((int32_t)bb_max_y, root_h);
-	}
-
-	/* Cap grid span to at most one full world period so periodic/toroidal worlds
-	 * never spawn duplicate wrapped chunks overlapping in 3D. */
-	if (sys->period_x > 0 && root_w > 0) {
-		int64_t max_cells_x = (sys->period_x + root_w - 1) / root_w;
-		if (max_cells_x < 1) max_cells_x = 1;
-		if ((int64_t)i1 - i0 + 1 > max_cells_x) {
-			float mid_x = (bb_min_x + bb_max_x) * 0.5f;
-			int32_t ic = morton_fdiv((int32_t)mid_x, root_w);
-			i0 = ic - (int32_t)(max_cells_x / 2);
-			i1 = i0 + (int32_t)max_cells_x - 1;
-		}
-	}
-
-	if (sys->period_y > 0 && root_h > 0) {
-		int64_t max_cells_y = (sys->period_y + root_h - 1) / root_h;
-		if (max_cells_y < 1) max_cells_y = 1;
-		if ((int64_t)j1 - j0 + 1 > max_cells_y) {
-			float mid_y = (bb_min_y + bb_max_y) * 0.5f;
-			int32_t jc = morton_fdiv((int32_t)mid_y, root_h);
-			j0 = jc - (int32_t)(max_cells_y / 2);
-			j1 = j0 + (int32_t)max_cells_y - 1;
-		}
-	}
+	ar_occluder_t *occ = (opts && opts->occluder && opts->occluder->valid) ? opts->occluder : NULL;
+	float occ_box_pad = opts ? opts->occluder_box_z_pad : 0.0f;
+	bool occ_pad_all = (b3d != NULL);
 
 	ar_candidate_t *cands = sys->cands_scratch;
 	size_t cand_count = 0;
@@ -1631,29 +2102,119 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	ar_cull_3d_fn c3d = (opts && opts->cull_3d_fn) ? opts->cull_3d_fn : sys->cull_3d_fn;
 	void *c3d_ctx = (opts && (opts->cull_3d_fn || opts->bounds_3d_fn || opts->bounds_fn)) ? opts->bounds_ctx : sys->bounds_ctx;
 
-	for (int32_t j = j0; j <= j1; j++) {
-		for (int32_t i = i0; i <= i1; i++) {
-			int32_t rox = i * root_w;
-			int32_t roy = j * root_h;
-			float b_min[3], b_max[3], center_xyz[3], span_w, span_h, dist_sq;
-			ar_compute_node_3d_box(sys, opts, (float)rox, (float)roy, (float)root_w, (float)root_h,
-			                       b_min, b_max, center_xyz, &span_w, &span_h, &dist_sq);
+	if (!frustum_misses_slab) {
+		/* 4. Determine root level that naturally covers the bounding box (cols * rows <= max_root_cells) */
+		uint8_t root_level = 0;
+		while (root_level + 1 < sys->max_levels) {
+			int32_t rw = sys->base_w << root_level;
+			int32_t rh = sys->base_h << root_level;
+			int32_t gi0 = morton_fdiv(ar_floor_i32(bb_min_x), rw);
+			int32_t gi1 = morton_fdiv(ar_floor_i32(bb_max_x), rw);
+			int32_t gj0 = morton_fdiv(ar_floor_i32(bb_min_y), rh);
+			int32_t gj1 = morton_fdiv(ar_floor_i32(bb_max_y), rh);
+			int64_t cols = (int64_t)gi1 - gi0 + 1;
+			int64_t rows = (int64_t)gj1 - gj0 + 1;
+			if (cols > 0 && rows > 0 && cols * rows <= max_root_cells)
+				break;
+			root_level++;
+		}
 
-			if (ar_frustum_test_box(&frustum, b_min[0], b_min[1], b_min[2],
-			                        b_max[0], b_max[1], b_max[2]) &&
-			    (!c3d || c3d(c3d_ctx, (float)rox, (float)roy, (float)root_w, (float)root_h,
-			                 z_min - margin, z_max + margin, center_xyz, span_w, span_h))) {
-				if (cand_count < max_candidates) {
-					float pw = ar_projected_screen_width_3d(mvp, opts, center_xyz,
-					                                        span_w, span_h, vp_w, vp_h);
-					cands[cand_count].ox = rox;
-					cands[cand_count].oy = roy;
-					cands[cand_count].level = root_level;
-					cands[cand_count].proj_w = pw;
-					cands[cand_count].dist_sq = dist_sq;
-					cands[cand_count].active = true;
-					cands[cand_count].split_blocked = false;
-					cand_count++;
+		if (opts && opts->min_level > 0 && root_level < opts->min_level)
+			root_level = opts->min_level;
+		if (opts && opts->max_level > 0 && root_level > opts->max_level)
+			root_level = opts->max_level;
+
+		int32_t root_w = sys->base_w << root_level;
+		int32_t root_h = sys->base_h << root_level;
+
+		int32_t i0 = morton_fdiv(ar_floor_i32(bb_min_x), root_w);
+		int32_t i1 = morton_fdiv(ar_floor_i32(bb_max_x), root_w);
+		int32_t j0 = morton_fdiv(ar_floor_i32(bb_min_y), root_h);
+		int32_t j1 = morton_fdiv(ar_floor_i32(bb_max_y), root_h);
+
+		uint8_t eff_max_lvl = (opts && opts->max_level > 0 && opts->max_level < sys->max_levels)
+			? opts->max_level : (uint8_t)(sys->max_levels - 1);
+		while (((int64_t)i1 - i0 + 1) * ((int64_t)j1 - j0 + 1) > max_root_cells &&
+		       root_level < eff_max_lvl) {
+			root_level++;
+			root_w = sys->base_w << root_level;
+			root_h = sys->base_h << root_level;
+			i0 = morton_fdiv(ar_floor_i32(bb_min_x), root_w);
+			i1 = morton_fdiv(ar_floor_i32(bb_max_x), root_w);
+			j0 = morton_fdiv(ar_floor_i32(bb_min_y), root_h);
+			j1 = morton_fdiv(ar_floor_i32(bb_max_y), root_h);
+		}
+
+		/* Cap grid span to at most one full world period so periodic/toroidal worlds
+		 * never spawn duplicate wrapped chunks overlapping in 3D. */
+		if (sys->period_x > 0 && root_w > 0) {
+			int64_t max_cells_x = (sys->period_x + root_w - 1) / root_w;
+			if (max_cells_x < 1) max_cells_x = 1;
+			if ((int64_t)i1 - i0 + 1 > max_cells_x) {
+				float mid_x = (bb_min_x + bb_max_x) * 0.5f;
+				int32_t ic = morton_fdiv(ar_floor_i32(mid_x), root_w);
+				i0 = ic - (int32_t)(max_cells_x / 2);
+				i1 = i0 + (int32_t)max_cells_x - 1;
+			}
+		}
+
+		if (sys->period_y > 0 && root_h > 0) {
+			int64_t max_cells_y = (sys->period_y + root_h - 1) / root_h;
+			if (max_cells_y < 1) max_cells_y = 1;
+			if ((int64_t)j1 - j0 + 1 > max_cells_y) {
+				float mid_y = (bb_min_y + bb_max_y) * 0.5f;
+				int32_t jc = morton_fdiv(ar_floor_i32(mid_y), root_h);
+				j0 = jc - (int32_t)(max_cells_y / 2);
+				j1 = j0 + (int32_t)max_cells_y - 1;
+			}
+		}
+
+		for (int32_t j = j0; j <= j1; j++) {
+			for (int32_t i = i0; i <= i1; i++) {
+				int32_t rox = i * root_w;
+				int32_t roy = j * root_h;
+				float b_min[3], b_max[3], center_xyz[3], span_w, span_h, dist_sq;
+				float nz_min, nz_max;
+				ar_compute_node_3d_box(sys, opts, world, root_level,
+				                       rox, roy, root_w, root_h,
+				                       eye_xyz, has_eye,
+				                       b_min, b_max, center_xyz, &span_w, &span_h, &dist_sq,
+				                       &nz_min, &nz_max);
+
+				if (ar_frustum_test_box_sat(&frustum, has_faabb, faabb_min, faabb_max,
+				                            b_min, b_max) &&
+				    (!c3d || c3d(c3d_ctx, (float)rox, (float)roy, (float)root_w, (float)root_h,
+				                 nz_min, nz_max, center_xyz, span_w, span_h)) &&
+				    !ar_occ_test_padded(occ, b_min, b_max, occ_box_pad, occ_pad_all)) {
+					float pw = ar_projected_screen_width_box_3d(mvp, opts, center_xyz,
+					                                            eye_xyz, has_eye,
+					                                            span_w, span_h, vp_w, vp_h);
+					size_t dst_idx = cand_count;
+					if (cand_count < max_candidates) {
+						cand_count++;
+					} else {
+						/* Keep closest roots if max_candidates is smaller than visible root count */
+						size_t far_idx = 0;
+						float far_d2 = cands[0].dist_sq;
+						for (size_t k = 1; k < cand_count; k++) {
+							if (cands[k].dist_sq > far_d2) {
+								far_d2 = cands[k].dist_sq;
+								far_idx = k;
+							}
+						}
+						if (dist_sq >= far_d2)
+							continue;
+						dst_idx = far_idx;
+					}
+					cands[dst_idx].ox = rox;
+					cands[dst_idx].oy = roy;
+					cands[dst_idx].level = root_level;
+					cands[dst_idx].proj_w = pw;
+					cands[dst_idx].dist_sq = dist_sq;
+					memcpy(cands[dst_idx].b_min, b_min, sizeof(b_min));
+					memcpy(cands[dst_idx].b_max, b_max, sizeof(b_max));
+					cands[dst_idx].active = true;
+					cands[dst_idx].split_blocked = false;
 				}
 			}
 		}
@@ -1682,7 +2243,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 	}
 
-	while (cand_count + 3 <= max_candidates) {
+	while (cand_count > 0) {
 		int best_idx = -1;
 		float best_ratio = 1.0f;
 
@@ -1731,6 +2292,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			int32_t ox, oy;
 			float   proj_w;
 			float   dist_sq;
+			float   b_min[3];
+			float   b_max[3];
 			bool    visible;
 			bool    cached;
 		} kids[4];
@@ -1741,20 +2304,26 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			kids[c].ox = pox + ((c & 1) ? cw : 0);
 			kids[c].oy = poy + ((c & 2) ? ch : 0);
 			kids[c].cached = false;
-			float b_min[3], b_max[3], center_xyz[3], span_w, span_h, dist_sq;
-			ar_compute_node_3d_box(sys, opts, (float)kids[c].ox, (float)kids[c].oy,
-			                       (float)cw, (float)ch,
-			                       b_min, b_max, center_xyz, &span_w, &span_h, &dist_sq);
-			kids[c].visible = ar_frustum_test_box(&frustum,
-			                                      b_min[0], b_min[1], b_min[2],
-			                                      b_max[0], b_max[1], b_max[2]) &&
+			float center_xyz[3], span_w, span_h, dist_sq, nz_min, nz_max;
+			ar_compute_node_3d_box(sys, opts, world, child_lvl,
+			                       kids[c].ox, kids[c].oy, cw, ch,
+			                       eye_xyz, has_eye,
+			                       kids[c].b_min, kids[c].b_max, center_xyz,
+			                       &span_w, &span_h, &dist_sq,
+			                       &nz_min, &nz_max);
+			kids[c].visible = ar_frustum_test_box_sat(&frustum, has_faabb, faabb_min, faabb_max,
+			                                          kids[c].b_min, kids[c].b_max) &&
 			                  (!c3d || c3d(c3d_ctx, (float)kids[c].ox, (float)kids[c].oy,
 			                               (float)cw, (float)ch,
-			                               z_min - margin, z_max + margin,
-			                               center_xyz, span_w, span_h));
+			                               nz_min, nz_max,
+			                               center_xyz, span_w, span_h)) &&
+			                  !ar_occ_test_padded(occ, kids[c].b_min, kids[c].b_max,
+			                                      occ_box_pad, occ_pad_all);
 			if (kids[c].visible) {
-				kids[c].proj_w = ar_projected_screen_width_3d(mvp, opts, center_xyz,
-				                                              span_w, span_h, vp_w, vp_h);
+				kids[c].proj_w = ar_projected_screen_width_box_3d(mvp, opts,
+				                                                  center_xyz,
+				                                                  eye_xyz, has_eye,
+				                                                  span_w, span_h, vp_w, vp_h);
 				kids[c].dist_sq = dist_sq;
 				if (max_pops > 0) {
 					uint64_t ckey = morton_quad_key(world, child_lvl, kids[c].ox, kids[c].oy,
@@ -1770,7 +2339,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 
 		if (vis_kids == 0) {
-			cands[best_idx].active = false;
+			/* Swap-remove dead candidate immediately so cand_count budget is never starved */
+			cands[best_idx] = cands[--cand_count];
 			continue;
 		}
 
@@ -1791,8 +2361,10 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			continue;
 		}
 
-		if (cand_count + vis_kids - 1 > max_candidates)
-			break;
+		if (cand_count + vis_kids - 1 > max_candidates) {
+			cands[best_idx].split_blocked = true;
+			continue;
+		}
 
 		if (max_pops > 0) {
 			pops_used += net_new_pops;
@@ -1801,29 +2373,21 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		bool replaced = false;
 		for (int c = 0; c < 4; c++) {
 			if (!kids[c].visible) continue;
-			if (!replaced) {
-				cands[best_idx].ox = kids[c].ox;
-				cands[best_idx].oy = kids[c].oy;
-				cands[best_idx].level = child_lvl;
-				cands[best_idx].proj_w = kids[c].proj_w;
-				cands[best_idx].dist_sq = kids[c].dist_sq;
-				cands[best_idx].active = true;
-				cands[best_idx].split_blocked = false;
-				replaced = true;
-			} else {
-				cands[cand_count].ox = kids[c].ox;
-				cands[cand_count].oy = kids[c].oy;
-				cands[cand_count].level = child_lvl;
-				cands[cand_count].proj_w = kids[c].proj_w;
-				cands[cand_count].dist_sq = kids[c].dist_sq;
-				cands[cand_count].active = true;
-				cands[cand_count].split_blocked = false;
-				cand_count++;
-			}
+			size_t dst_idx = replaced ? cand_count++ : (size_t)best_idx;
+			replaced = true;
+			cands[dst_idx].ox = kids[c].ox;
+			cands[dst_idx].oy = kids[c].oy;
+			cands[dst_idx].level = child_lvl;
+			cands[dst_idx].proj_w = kids[c].proj_w;
+			cands[dst_idx].dist_sq = kids[c].dist_sq;
+			memcpy(cands[dst_idx].b_min, kids[c].b_min, sizeof(kids[c].b_min));
+			memcpy(cands[dst_idx].b_max, kids[c].b_max, sizeof(kids[c].b_max));
+			cands[dst_idx].active = true;
+			cands[dst_idx].split_blocked = false;
 		}
 	}
 
-	/* 6. Populate Active Output Leaf Nodes */
+	/* 6. Populate Active Output Leaf Nodes (Front-to-Back for Conservative Occlusion) */
 	size_t active_count = 0;
 	ar_candidate_t *active_cands = sys->active_cands_scratch;
 	for (size_t i = 0; i < cand_count; i++) {
@@ -1849,7 +2413,15 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 	}
 
+	ar_point_3d_fn pt3d = opts ? opts->point_3d_fn : NULL;
+	void *pt3d_ctx = (opts && opts->bounds_ctx) ? opts->bounds_ctx : sys->bounds_ctx;
+
 	for (size_t i = 0; i < active_count && out_count < max_candidates; i++) {
+		if (occ && ar_occ_test_padded(occ, active_cands[i].b_min, active_cands[i].b_max,
+		                              occ_box_pad, occ_pad_all)) {
+			continue;
+		}
+
 		ar_node_t *node = ar_get_or_populate(sys, world,
 		                                     active_cands[i].level,
 		                                     active_cands[i].ox,
@@ -1865,6 +2437,18 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 				sys->stats.max_level_observed = node->level;
 			if (node->level < sys->stats.min_level_observed)
 				sys->stats.min_level_observed = node->level;
+
+			if (occ && !(opts && opts->occluder_no_write)) {
+				float texel_span = (float)((node->w > node->h) ? node->w : node->h) /
+				                   (float)((node->grid_dim > 0) ? node->grid_dim : 1u);
+				float coarse_k = (node->grid_dim < 8u) ? (float)node->grid_dim : 8.0f;
+				float cell_span = (float)((node->w > node->h) ? node->w : node->h) / coarse_k;
+				float node_z_bias = opts->occluder_z_bias +
+				                    texel_span * opts->occluder_texel_bias +
+				                    (cell_span * cell_span * 0.125f) * opts->occluder_concave_inv_r;
+				ar_occluder_rasterize_node(occ, node, sys->value_scale, node_z_bias,
+				                           pt3d, pt3d_ctx);
+			}
 		}
 	}
 

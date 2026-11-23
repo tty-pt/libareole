@@ -89,6 +89,67 @@ static void custom_spherical_bounds_cb(void *bounds_ctx, float ox, float oy, flo
 	*inout_z_min -= sag;
 }
 
+/* High-relief sampler spanning [-350, +750] wu for Test 28 frustum oracle */
+static float high_relief_height(float fx, float fy)
+{
+	float h = 380.0f * sinf(fx * 0.0018f) * cosf(fy * 0.0015f)
+	        + 180.0f * cosf((fx + fy) * 0.0042f)
+	        + 120.0f * sinf((fx - fy) * 0.0075f) + 150.0f;
+	return h;
+}
+
+static void high_relief_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                                int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx; (void)world; (void)level;
+	float h = high_relief_height((float)wx, (float)wy);
+	out->val = (int16_t)(h * 16.0f);
+	out->rgba = 0xFF558833u;
+	out->flags = 0u;
+}
+
+/* Annular mountain ridge wall around origin (r in [450..850] -> z=+1100; outer peak at (0,-2400) -> z=+2400) */
+typedef struct {
+	float ridge_dir_x;
+	float ridge_dir_y;
+	float peak_x;
+	float peak_y;
+	float peak_h;
+} ridge_scene_ctx_t;
+
+static void ridge_wall_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                               int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)world; (void)level;
+	const ridge_scene_ctx_t *rc = (const ridge_scene_ctx_t *)user_ctx;
+	float x = (float)wx, y = (float)wy;
+	float along = x * rc->ridge_dir_x + y * rc->ridge_dir_y;
+	float perp  = -x * rc->ridge_dir_y + y * rc->ridge_dir_x;
+	float h = 0.0f;
+	/* Wide solid ridge wall perpendicular to look direction at distance [500..900] */
+	if (along >= 500.0f && along <= 940.0f && fabsf(perp) <= 2200.0f) {
+		h = 480.0f;
+	}
+	/* Tall background peak behind the wall that rises above the silhouette */
+	float pdx = x - rc->peak_x;
+	float pdy = y - rc->peak_y;
+	if (pdx * pdx + pdy * pdy < 360.0f * 360.0f) {
+		if (rc->peak_h > h) h = rc->peak_h;
+	}
+	out->val = (int16_t)(h * 16.0f);
+	out->rgba = 0xFF607080u;
+	out->flags = 0u;
+}
+
+static void flat_ocean_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                               int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx; (void)world; (void)level; (void)wx; (void)wy;
+	out->val = 0;
+	out->rgba = 0xFF103060u;
+	out->flags = 0u;
+}
+
 static void level_dependent_sampler(void *user_ctx, uint16_t world, uint8_t level,
                                     int32_t wx, int32_t wy, ar_sample_t *out)
 {
@@ -1584,6 +1645,321 @@ int main(void)
 		}
 		ar_system_destroy(z_sys);
 		printf("  [PASS] Non-zero focal_z camera target elevation invariance verified across [-600, 0, +950] wu\n");
+	}
+
+	/* 28. Ground-Truth Frustum Visibility Oracle (Zero False Negatives across 360-deg Yaw x Low-to-High Pitch x Distances) */
+	{
+		ar_config_t o_cfg = {
+			.base_w = 128, .base_h = 128, .grid_dim = 8,
+			.pool_capacity = 512, .max_active = 256, .max_levels = 10,
+			.z_min = -600.0f, .z_max = 900.0f,
+			.target_quad_px = 4.0f,
+			.sampler = high_relief_sampler
+		};
+		ar_system_t *o_sys = ar_system_create_ex(&o_cfg);
+		assert(o_sys != NULL);
+
+		const float pitches_deg[5] = { 12.0f, 20.0f, 35.0f, 55.0f, 80.0f };
+		const float dists[3] = { 280.0f, 1200.0f, 3600.0f };
+		const float aspects[2] = { 1280.0f / 720.0f, 1024.0f / 768.0f };
+		size_t total_vis_pts = 0, total_misses = 0, total_poses = 0;
+
+		for (int ai = 0; ai < 2; ai++) {
+			float vp_w = (ai == 0) ? 1280.0f : 1024.0f;
+			float vp_h = (ai == 0) ?  720.0f :  768.0f;
+			for (int di = 0; di < 3; di++) {
+				float dist = dists[di];
+				for (int pi = 0; pi < 5; pi++) {
+					float pitch = pitches_deg[pi] * (3.14159265f / 180.0f);
+					for (int yi = 0; yi < 12; yi++) {
+						float yaw = (float)yi * (3.14159265f / 6.0f);
+						float sin_y = sinf(yaw), cos_y = cosf(yaw);
+						float sin_p = sinf(pitch), cos_p = cosf(pitch);
+						float eye[3] = { dist * cos_p * sin_y, dist * cos_p * cos_y, 200.0f + dist * sin_p };
+						float tgt[3] = { 0.0f, 0.0f, 200.0f };
+						float up[3]  = { -sin_p * sin_y, -sin_p * cos_y, cos_p };
+						float view_m[16], proj_m[16], mvp[16];
+						ar_mat4_lookat(view_m, eye, tgt, up);
+						ar_mat4_perspective(proj_m, 0.785398f, aspects[ai], 4.0f, dist * 12.0f + 4000.0f);
+						ar_mat4_multiply(mvp, proj_m, view_m);
+
+						ar_cull_opts_t opts;
+						memset(&opts, 0, sizeof(opts));
+						opts.z_min = -600.0f;
+						opts.z_max =  900.0f;
+						opts.focal_x = 0.0f;
+						opts.focal_y = 0.0f;
+						opts.focal_z = 200.0f;
+						opts.viewport_w = vp_w;
+						opts.viewport_h = vp_h;
+						opts.target_quad_px = 4.0f;
+
+						const ar_node_t *vis[256];
+						size_t cnt = ar_system_query_matrix(o_sys, 1, mvp, &opts, vis, 256);
+						assert(cnt > 0);
+						total_poses++;
+
+						/* Verify zero overlapping nodes and every returned node passes frustum */
+						ar_frustum_t fr;
+						ar_frustum_from_matrix(&fr, mvp);
+						for (size_t i = 0; i < cnt; i++) {
+							assert(ar_frustum_test_box(&fr, (float)vis[i]->ox, (float)vis[i]->oy, -600.0f,
+							                           (float)(vis[i]->ox + vis[i]->w),
+							                           (float)(vis[i]->oy + vis[i]->h), 900.0f));
+							for (size_t j = i + 1; j < cnt; j++) {
+								bool ov_x = (vis[i]->ox < vis[j]->ox + vis[j]->w) && (vis[j]->ox < vis[i]->ox + vis[i]->w);
+								bool ov_y = (vis[i]->oy < vis[j]->oy + vis[j]->h) && (vis[j]->oy < vis[i]->oy + vis[i]->h);
+								assert(!(ov_x && ov_y));
+							}
+						}
+
+						/* Ground-truth oracle: sample dense lattice around view & verify 0 visible points missed */
+						float span = dist * 2.8f + 900.0f;
+						float step = span / 18.0f;
+						for (int gy = -9; gy <= 9; gy++) {
+							for (int gx = -9; gx <= 9; gx++) {
+								float px = (float)gx * step;
+								float py = (float)gy * step;
+								float pz = high_relief_height(px, py);
+								float cx = mvp[0]*px + mvp[4]*py + mvp[8]*pz  + mvp[12];
+								float cy = mvp[1]*px + mvp[5]*py + mvp[9]*pz  + mvp[13];
+								float cz = mvp[2]*px + mvp[6]*py + mvp[10]*pz + mvp[14];
+								float cw = mvp[3]*px + mvp[7]*py + mvp[11]*pz + mvp[15];
+								if (cw <= 4.0f) continue;
+								float nx = cx / cw, ny = cy / cw, nz = cz / cw;
+								if (fabsf(nx) <= 0.99f && fabsf(ny) <= 0.99f && nz >= -1.0f && nz <= 1.0f) {
+									total_vis_pts++;
+									bool covered = false;
+									for (size_t i = 0; i < cnt; i++) {
+										if (px >= (float)vis[i]->ox && px < (float)(vis[i]->ox + vis[i]->w) &&
+										    py >= (float)vis[i]->oy && py < (float)(vis[i]->oy + vis[i]->h)) {
+											covered = true;
+											break;
+										}
+									}
+									if (!covered) total_misses++;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		assert(total_vis_pts > 5000);
+		assert(total_misses == 0);
+
+		/* Looking straight up into sky above z_max must return 0 nodes (tight false positives) */
+		{
+			float eye[3] = { 0.0f, 0.0f, 1500.0f };
+			float tgt[3] = { 0.0f, 0.0f, 5000.0f };
+			float up[3]  = { 0.0f, 1.0f, 0.0f };
+			float vm[16], pm[16], mvp[16];
+			ar_mat4_lookat(vm, eye, tgt, up);
+			ar_mat4_perspective(pm, 0.785398f, 16.0f / 9.0f, 10.0f, 50000.0f);
+			ar_mat4_multiply(mvp, pm, vm);
+			ar_cull_opts_t opts;
+			memset(&opts, 0, sizeof(opts));
+			opts.z_min = -600.0f; opts.z_max = 900.0f;
+			opts.viewport_w = 1280.0f; opts.viewport_h = 720.0f;
+			const ar_node_t *vis[64];
+			size_t sky_cnt = ar_system_query_matrix(o_sys, 1, mvp, &opts, vis, 64);
+			assert(sky_cnt == 0);
+		}
+
+		/* Diagonal yaw tombstone budget test: tight max_active=24 must never starve on vis_kids==0 */
+		{
+			float yaw = 0.785398f; /* 45 deg */
+			float pitch = 0.45f;
+			float dist = 900.0f;
+			float eye[3] = { dist * cosf(pitch) * sinf(yaw), dist * cosf(pitch) * cosf(yaw), dist * sinf(pitch) };
+			float tgt[3] = { 0.0f, 0.0f, 0.0f };
+			float up[3]  = { -sinf(pitch) * sinf(yaw), -sinf(pitch) * cosf(yaw), cosf(pitch) };
+			float vm[16], pm[16], mvp[16];
+			ar_mat4_lookat(vm, eye, tgt, up);
+			ar_mat4_perspective(pm, 0.785398f, 16.0f / 9.0f, 4.0f, 12000.0f);
+			ar_mat4_multiply(mvp, pm, vm);
+			ar_cull_opts_t opts;
+			memset(&opts, 0, sizeof(opts));
+			opts.z_min = -600.0f; opts.z_max = 900.0f;
+			opts.viewport_w = 1280.0f; opts.viewport_h = 720.0f;
+			opts.target_quad_px = 1.0f;
+			const ar_node_t *vis[24];
+			size_t dcnt = ar_system_query_matrix(o_sys, 1, mvp, &opts, vis, 24);
+			assert(dcnt >= 18 && dcnt <= 24);
+		}
+
+		ar_system_destroy(o_sys);
+		printf("  [PASS] Frustum visibility oracle verified: %zu poses, %zu visible pts, 0 false negatives, sky=0\n",
+		       total_poses, total_vis_pts);
+	}
+
+	/* 29. Conservative 2D Software Hi-Z Occluder (360-deg Mountain Wall + Multi-Scale 2..16M Linear-W Precision) */
+	{
+		ridge_scene_ctx_t rc = { 0.0f, -1.0f, 0.0f, -2400.0f, 2400.0f };
+		ar_config_t occ_cfg = {
+			.base_w = 128, .base_h = 128, .grid_dim = 8,
+			.pool_capacity = 512, .max_active = 256, .max_levels = 8,
+			.z_min = -50.0f, .z_max = 2600.0f,
+			.target_quad_px = 6.0f,
+			.sampler = ridge_wall_sampler,
+			.user_ctx = &rc
+		};
+		ar_system_t *occ_sys = ar_system_create_ex(&occ_cfg);
+		assert(occ_sys != NULL);
+
+		/* 29a. 360-degree mountain ridge occlusion sweep (8 yaws every 45 deg) */
+		uint32_t total_culled = 0;
+		for (int yi = 0; yi < 8; yi++) {
+			float yaw = (float)yi * (3.14159265f / 4.0f);
+			float look_x = -sinf(yaw);
+			float look_y = -cosf(yaw);
+			rc.ridge_dir_x = look_x;
+			rc.ridge_dir_y = look_y;
+			rc.peak_x = look_x * 2400.0f;
+			rc.peak_y = look_y * 2400.0f;
+			rc.peak_h = 1500.0f;
+			ar_system_clear(occ_sys);
+
+			float eye[3] = { -look_x * 250.0f, -look_y * 250.0f, 200.0f };
+			float tgt[3] = {  look_x * 750.0f,  look_y * 750.0f, 450.0f };
+			float up[3]  = { 0.0f, 0.0f, 1.0f };
+			float vm[16], pm[16], mvp[16];
+			ar_mat4_lookat(vm, eye, tgt, up);
+			ar_mat4_perspective(pm, 0.785398f, 16.0f / 9.0f, 4.0f, 8000.0f);
+			ar_mat4_multiply(mvp, pm, vm);
+
+			/* Warm up cache so cached_bounds gives tight vertical boxes for the z=0 valley behind the wall */
+			ar_cull_opts_t opts;
+			memset(&opts, 0, sizeof(opts));
+			opts.z_min = -50.0f; opts.z_max = 2600.0f;
+			opts.focal_x = tgt[0]; opts.focal_y = tgt[1]; opts.focal_z = tgt[2];
+			opts.viewport_w = 1280.0f; opts.viewport_h = 720.0f;
+			opts.target_quad_px = 6.0f;
+			opts.use_cached_bounds = true;
+			opts.cached_bounds_max_level = 7;
+			opts.cached_bounds_pad = 16.0f;
+
+			const ar_node_t *vis_no_occ[256];
+			size_t cnt_no_occ = ar_system_query_matrix(occ_sys, 1, mvp, &opts, vis_no_occ, 256);
+			assert(cnt_no_occ > 10);
+
+			/* Now query WITH conservative Hi-Z occluder */
+			ar_occluder_t occ;
+			ar_occluder_reset(&occ, mvp, 4.0f, 0.002f);
+			opts.occluder = &occ;
+			opts.occluder_z_bias = 12.0f;
+
+			const ar_node_t *vis_occ[256];
+			size_t cnt_occ = ar_system_query_matrix(occ_sys, 1, mvp, &opts, vis_occ, 256);
+			assert(cnt_occ > 0);
+			assert(occ.culled_count > 0);
+			assert(cnt_occ < cnt_no_occ);
+			total_culled += occ.culled_count;
+
+			/* Zero false negatives: the tall peak (z=2400) rising above the ridge MUST remain visible */
+			bool found_peak = false;
+			for (size_t i = 0; i < cnt_occ; i++) {
+				if (rc.peak_x >= (float)vis_occ[i]->ox && rc.peak_x < (float)(vis_occ[i]->ox + vis_occ[i]->w) &&
+				    rc.peak_y >= (float)vis_occ[i]->oy && rc.peak_y < (float)(vis_occ[i]->oy + vis_occ[i]->h)) {
+					found_peak = true;
+					break;
+				}
+			}
+			assert(found_peak);
+		}
+		assert(total_culled >= 8);
+
+		/* 29b. Multi-scale linear-W depth precision (close-up lamb at w=5, ridge at w=800, moon at w=16,000,000) */
+		{
+			float eye[3] = { 0.0f, 0.0f, 5.0f };
+			float tgt[3] = { 0.0f, 100.0f, 5.0f };
+			float up[3]  = { 0.0f, 0.0f, 1.0f };
+			float vm[16], pm[16], mvp[16];
+			ar_mat4_lookat(vm, eye, tgt, up);
+			ar_mat4_perspective(pm, 0.785398f, 16.0f / 9.0f, 2.0f, 25000000.0f);
+			ar_mat4_multiply(mvp, pm, vm);
+
+			ar_occluder_t occ;
+			ar_occluder_reset(&occ, mvp, 2.0f, 0.002f);
+
+			/* Rasterize opaque mountain ridge spanning lower half of screen at y=800 (z in [-200..+5]) */
+			float r0[3] = { -1500.0f, 800.0f, -400.0f };
+			float r1[3] = {  1500.0f, 800.0f, -400.0f };
+			float r2[3] = {  1500.0f, 800.0f,    5.0f };
+			float r3[3] = { -1500.0f, 800.0f,    5.0f };
+			ar_occluder_rasterize_tri(&occ, r0, r1, r2);
+			ar_occluder_rasterize_tri(&occ, r0, r2, r3);
+
+			/* 1. Close-up lamb in front of ridge (y in [4..6]) -> NOT occluded */
+			float lamb_min[3] = { -0.5f, 4.0f, 4.0f };
+			float lamb_max[3] = {  0.5f, 6.0f, 5.0f };
+			assert(!ar_occluder_test_box(&occ, lamb_min, lamb_max));
+
+			/* 2. Distant companion moon at y=16,000,000 completely below ridge horizon -> OCCLUDED */
+			float moon_hid_min[3] = { -500000.0f, 16000000.0f, -4000000.0f };
+			float moon_hid_max[3] = {  500000.0f, 16500000.0f, -1500000.0f };
+			assert(ar_occluder_test_box(&occ, moon_hid_min, moon_hid_max));
+
+			/* 3. Distant companion moon rising above ridge into sky -> NOT occluded */
+			float moon_sky_min[3] = { -500000.0f, 16000000.0f,  1000000.0f };
+			float moon_sky_max[3] = {  500000.0f, 16500000.0f,  3000000.0f };
+			assert(!ar_occluder_test_box(&occ, moon_sky_min, moon_sky_max));
+
+			/* 4. Distant companion moon grazing right below silhouette edge (within 1 occ pixel) -> NOT occluded */
+			float moon_edge_min[3] = { -100000.0f, 16000000.0f, -100000.0f };
+			float moon_edge_max[3] = {  100000.0f, 16500000.0f,   -5000.0f };
+			assert(!ar_occluder_test_box(&occ, moon_edge_min, moon_edge_max));
+		}
+
+		ar_system_destroy(occ_sys);
+		printf("  [PASS] Conservative 2D Hi-Z occluder verified (8 yaws, %u hidden chunks culled, multi-scale 2..16M linear-W exact)\n",
+		       total_culled);
+	}
+
+	/* 30. Opt-In Cached-Node Z-Tightening (Eliminates Global Skyscraper False Positives) */
+	{
+		ar_config_t cb_cfg = {
+			.base_w = 128, .base_h = 128, .grid_dim = 8,
+			.pool_capacity = 256, .max_active = 128, .max_levels = 6,
+			.z_min = -2600.0f, .z_max = 3200.0f,
+			.target_quad_px = 4.0f,
+			.sampler = flat_ocean_sampler
+		};
+		ar_system_t *cb_sys = ar_system_create_ex(&cb_cfg);
+		assert(cb_sys != NULL);
+
+		/* Camera at z=400 looking slightly UP (+15 deg) over flat z=0 ocean:
+		 * true z=0 ocean is completely BELOW the frustum, whereas global z_max=+3200 still intersects it! */
+		float eye[3] = { 0.0f, 0.0f, 400.0f };
+		float tgt[3] = { 0.0f, -1000.0f, 950.0f };
+		float up[3]  = { 0.0f, 0.0f, 1.0f };
+		float vm[16], pm[16], mvp[16];
+		ar_mat4_lookat(vm, eye, tgt, up);
+		ar_mat4_perspective(pm, 0.523599f, 16.0f / 9.0f, 4.0f, 12000.0f);
+		ar_mat4_multiply(mvp, pm, vm);
+
+		ar_cull_opts_t opts;
+		memset(&opts, 0, sizeof(opts));
+		opts.z_min = -2600.0f; opts.z_max = 3200.0f;
+		opts.focal_x = 0.0f; opts.focal_y = -1000.0f; opts.focal_z = 0.0f;
+		opts.viewport_w = 1280.0f; opts.viewport_h = 720.0f;
+		opts.target_quad_px = 4.0f;
+
+		const ar_node_t *vis_wide[128];
+		size_t cnt_wide = ar_system_query_matrix(cb_sys, 1, mvp, &opts, vis_wide, 128);
+		assert(cnt_wide > 0); /* Global z_max=+3200 pulled in flat ocean chunks */
+
+		/* Now enable cached bounds tightening on those already-cached flat ocean nodes */
+		opts.use_cached_bounds = true;
+		opts.cached_bounds_max_level = 5;
+		opts.cached_bounds_pad = 8.0f;
+		const ar_node_t *vis_tight[128];
+		size_t cnt_tight = ar_system_query_matrix(cb_sys, 1, mvp, &opts, vis_tight, 128);
+		assert(cnt_tight < cnt_wide);
+
+		ar_system_destroy(cb_sys);
+		printf("  [PASS] Cached-node Z-tightening verified (global slab=%zu -> cached tight=%zu false positives)\n",
+		       cnt_wide, cnt_tight);
 	}
 
 	ar_system_destroy(cs);

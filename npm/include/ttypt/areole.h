@@ -131,6 +131,33 @@ typedef bool (*ar_cull_3d_fn)(void *bounds_ctx, float ox, float oy, float w, flo
                               float z_min, float z_max,
                               const float center_xyz[3], float span_w, float span_h);
 
+/* Optional user-supplied 3D manifold point projection callback:
+ * Maps a single 2D manifold point (wx, wy, z) into 3D Cartesian coordinates in the space of `mvp`. */
+typedef void (*ar_point_3d_fn)(void *ctx, float wx, float wy, float z, float out_xyz[3]);
+
+/* ========================================================================= */
+/* Conservative 2D Software Hi-Z Occluder (Linear Clip-Space W Depth)        */
+/* ========================================================================= */
+
+#define AR_OCC_W     96
+#define AR_OCC_H     54
+#define AR_OCC_TILE  8
+#define AR_OCC_TW    ((AR_OCC_W + AR_OCC_TILE - 1) / AR_OCC_TILE) /* 12 */
+#define AR_OCC_TH    ((AR_OCC_H + AR_OCC_TILE - 1) / AR_OCC_TILE) /* 7 */
+#define AR_OCC_TILES (AR_OCC_TW * AR_OCC_TH)                      /* 84 */
+
+typedef struct {
+	float    mvp[16];
+	float    depth[AR_OCC_W * AR_OCC_H]; /* Linear clip-space w; FLT_MAX = unoccluded */
+	float    tile_max[AR_OCC_TILES];     /* Lazy max depth per 8x8 tile */
+	uint32_t tile_dirty[3];              /* Dirty bitmask for AR_OCC_TILES tiles */
+	float    near_w;                     /* Clip-w floor below which geometry is near/behind camera */
+	float    depth_bias;                 /* Relative linear-w safety margin (e.g. 0.002f) */
+	uint32_t culled_count;
+	uint32_t tested_count;
+	bool     valid;
+} ar_occluder_t;
+
 /* Runtime configuration for ar_system_create_ex */
 typedef struct {
 	int32_t          base_w;               /* Level 0 width in world units (required > 0) */
@@ -237,6 +264,18 @@ typedef struct {
 	float        fallback_persp_aspect;   /* Optional fallback perspective aspect ratio when mvp[0]==0 (0 = 1.5f) */
 	float        behind_cam_clip_w;       /* Optional clip-space W threshold for behind/straddling camera (0 = 1.0f) */
 	float        behind_cam_screen_mult;  /* Optional viewport width multiplier when straddling camera (0 = 2.0f) */
+	/* Optional conservative 2D Hi-Z occlusion culling (NULL = disabled) */
+	ar_occluder_t *occluder;              /* Pre-reset occluder (tested & populated front-to-back) */
+	ar_point_3d_fn point_3d_fn;           /* Optional 3D manifold point projection for occluder rasterization */
+	float          occluder_z_bias;       /* Base vertical lowering bias applied when rasterizing occluder mesh */
+	float          occluder_texel_bias;   /* Extra vertical lowering bias per texel span (handles sub-grid dips) */
+	float          occluder_concave_inv_r;/* Max concave curvature 1/R for coarse chord sagitta lowering (0 = flat/convex) */
+	float          occluder_box_z_pad;    /* Extra Z padding applied to AABB during occluder visibility test */
+	bool           occluder_no_write;     /* When true, test against occluder without rasterizing emitted nodes */
+	/* Optional cached-node vertical bounds tightening (false = disabled) */
+	bool           use_cached_bounds;     /* Tighten node [z_min, z_max] from cached min_val/max_val */
+	uint8_t        cached_bounds_max_level;/* Max LOD level eligible for cached bounds tightening */
+	float          cached_bounds_pad;     /* Extra vertical padding around cached [min_val, max_val] */
 } ar_cull_opts_t;
 
 /* Camera viewpoint and frustum descriptor */
@@ -336,6 +375,17 @@ void ar_frustum_from_matrix(ar_frustum_t *out_frustum, const float mvp[16]);
 bool ar_frustum_test_box(const ar_frustum_t *frustum,
                          float min_x, float min_y, float min_z,
                          float max_x, float max_y, float max_z);
+
+/* Conservative 2D Software Hi-Z Occluder (Linear Clip-Space W Depth) */
+void ar_occluder_reset(ar_occluder_t *occ, const float mvp[16],
+                       float near_w, float depth_bias);
+void ar_occluder_rasterize_tri(ar_occluder_t *occ,
+                               const float p0[3], const float p1[3], const float p2[3]);
+void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
+                                float value_scale, float z_bias,
+                                ar_point_3d_fn point_fn, void *point_ctx);
+bool ar_occluder_test_box(ar_occluder_t *occ,
+                          const float b_min[3], const float b_max[3]);
 
 /* Primary Matrix Query API */
 size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
