@@ -509,6 +509,33 @@ void ar_occluder_rasterize_tri(ar_occluder_t *occ,
 	}
 }
 
+static void ar_node_compute_occ_cell_min(ar_node_t *node)
+{
+	if (!node || !node->values || node->grid_dim == 0) {
+		if (node) node->occ_grid_k = 0;
+		return;
+	}
+	uint32_t gd = node->grid_dim;
+	uint32_t vd = node->vert_dim;
+	uint32_t K = (gd < AR_OCC_CELL_K) ? gd : AR_OCC_CELL_K;
+	uint32_t s[AR_OCC_CELL_K + 1u];
+	for (uint32_t c = 0; c <= K; c++)
+		s[c] = (c * gd) / K;
+	for (uint32_t gr = 0; gr < K; gr++) {
+		for (uint32_t gc = 0; gc < K; gc++) {
+			int16_t mn = 32767;
+			for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
+				const int16_t *vrow = &node->values[vy * vd];
+				for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
+					if (vrow[vx] < mn) mn = vrow[vx];
+				}
+			}
+			node->occ_cell_min[gr * K + gc] = mn;
+		}
+	}
+	node->occ_grid_k = (uint8_t)K;
+}
+
 void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
                                 float value_scale, float z_bias,
                                 ar_point_3d_fn point_fn, void *point_ctx)
@@ -521,31 +548,37 @@ void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
 	float inv_scale = 1.0f / ((value_scale > 0.0f) ? value_scale : AR_DEFAULT_VALUE_SCALE);
 	uint32_t gd = node->grid_dim;
 	uint32_t vd = node->vert_dim;
-	uint32_t K = (gd < 8u) ? gd : 8u;
+	uint32_t K = (gd < AR_OCC_CELL_K) ? gd : AR_OCC_CELL_K;
 
-	uint32_t s[9];
+	uint32_t s[AR_OCC_CELL_K + 1u];
 	for (uint32_t c = 0; c <= K; c++)
 		s[c] = (c * gd) / K;
 
-	/* Step 1: exact minimum sample inside each coarse cell [s[gc]..s[gc+1]] x [s[gr]..s[gr+1]] */
-	int16_t cell_min[64];
-	for (uint32_t gr = 0; gr < K; gr++) {
-		for (uint32_t gc = 0; gc < K; gc++) {
-			int16_t mn = 32767;
-			for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
-				const int16_t *vrow = &node->values[vy * vd];
-				for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
-					if (vrow[vx] < mn) mn = vrow[vx];
+	/* Step 1: exact minimum sample inside each coarse cell (use precomputed cache if available) */
+	int16_t cell_min_fallback[AR_OCC_CELL_K * AR_OCC_CELL_K];
+	const int16_t *cell_min;
+	if (node->occ_grid_k == K) {
+		cell_min = node->occ_cell_min;
+	} else {
+		for (uint32_t gr = 0; gr < K; gr++) {
+			for (uint32_t gc = 0; gc < K; gc++) {
+				int16_t mn = 32767;
+				for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
+					const int16_t *vrow = &node->values[vy * vd];
+					for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
+						if (vrow[vx] < mn) mn = vrow[vx];
+					}
 				}
+				cell_min_fallback[gr * K + gc] = mn;
 			}
-			cell_min[gr * K + gc] = mn;
 		}
+		cell_min = cell_min_fallback;
 	}
 
 	/* Step 2: each coarse vertex takes min of all incident coarse cells,
 	 * guaranteeing the entire piecewise-linear watertight coarse mesh lies <= H(x, y) everywhere */
-	float verts[81][3];
-	float vert_wz[81];
+	float verts[(AR_OCC_CELL_K + 1u) * (AR_OCC_CELL_K + 1u)][3];
+	float vert_wz[(AR_OCC_CELL_K + 1u) * (AR_OCC_CELL_K + 1u)];
 	float inv_gd = 1.0f / (float)gd;
 	for (uint32_t vr = 0; vr <= K; vr++) {
 		uint32_t r0 = (vr > 0u) ? (vr - 1u) : 0u;
@@ -793,6 +826,7 @@ typedef struct {
 	uint8_t level;
 	float   proj_w;
 	float   dist_sq;
+	float   split_ratio;
 	float   b_min[3];
 	float   b_max[3];
 	bool    active;
@@ -877,6 +911,8 @@ struct ar_system {
 	const ar_node_t **active_chunks;
 	ar_candidate_t   *cands_scratch;
 	ar_candidate_t   *active_cands_scratch;
+	uint32_t         *heap_scratch;
+	uint32_t         *free_scratch;
 	size_t            active_count;
 	uint8_t          *staging_arena;
 
@@ -1083,6 +1119,8 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	size_t active_bytes = ar_align8((size_t)max_act * sizeof(ar_node_t *));
 	size_t cands_bytes = ar_align8((size_t)(max_act + 8u) * sizeof(ar_candidate_t));
 	size_t active_cands_bytes = ar_align8((size_t)max_act * sizeof(ar_candidate_t));
+	size_t heap_bytes = ar_align8((size_t)(max_act + 8u) * sizeof(uint32_t));
+	size_t free_bytes = ar_align8((size_t)(max_act + 8u) * sizeof(uint32_t));
 
 	size_t per_node_vals = ar_align8((size_t)vert_count * sizeof(int16_t));
 	size_t per_node_rgba = ar_align8((size_t)vert_count * sizeof(uint32_t));
@@ -1090,7 +1128,8 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	size_t per_node_arena = per_node_vals + per_node_rgba + per_node_samples;
 
 	size_t total_bytes = sys_bytes + pool_bytes + pool_meta_bytes + active_bytes +
-	                     cands_bytes + active_cands_bytes + (size_t)pool_cap * per_node_arena;
+	                     cands_bytes + active_cands_bytes + heap_bytes + free_bytes +
+	                     (size_t)pool_cap * per_node_arena;
 
 	uint8_t *arena = (uint8_t *)calloc(1, total_bytes);
 	if (!arena)
@@ -1113,6 +1152,12 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 
 	sys->active_cands_scratch = (ar_candidate_t *)cursor;
 	cursor += active_cands_bytes;
+
+	sys->heap_scratch = (uint32_t *)cursor;
+	cursor += heap_bytes;
+
+	sys->free_scratch = (uint32_t *)cursor;
+	cursor += free_bytes;
 
 	for (uint16_t i = 0; i < pool_cap; i++) {
 		sys->pool[i].grid_dim = grid_dim;
@@ -1416,6 +1461,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 					node->min_val = meta->async_min_val;
 					node->max_val = meta->async_max_val;
 					node->flags = meta->async_flags;
+					ar_node_compute_occ_cell_min(node);
 					node->rev++;
 					sys->stats.sampler_invocations_total += sys->vert_count;
 				}
@@ -1652,6 +1698,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			}
 		}
 		node->flags |= AR_NODE_FLAG_DEFERRED;
+		node->occ_grid_k = 0;
 		node->rev++;
 #ifdef TTYPT_WQ_H
 		if (sys->wq && sys->staging_arena && !stl_wq_busy(&meta->async_task)) {
@@ -1747,6 +1794,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			}
 		}
 	}
+	ar_node_compute_occ_cell_min(node);
 	node->rev++;
 
 	return node;
@@ -1792,6 +1840,87 @@ static inline int32_t ar_floor_i32(float v)
 	if (v < -1e9f) return -1000000000;
 	if (v >  1e9f) return  1000000000;
 	return (int32_t)floorf(v);
+}
+
+static inline float ar_cand_split_ratio(const ar_system_t *sys, uint16_t world,
+                                        const ar_candidate_t *cand,
+                                        float split_threshold, float hyst,
+                                        uint32_t view_mask)
+{
+	float node_thresh = split_threshold;
+	if (hyst > 0.0f) {
+		uint64_t pkey = morton_quad_key(world, cand->level, cand->ox, cand->oy,
+		                                sys->base_w, sys->base_h);
+		bool kids_were_active = false;
+		for (uint8_t q = 0; q < 4; q++) {
+			uint64_t ckey = morton_quad_child(pkey, q);
+			uint32_t cslot = 0;
+			if (islet_quad_map_get(&sys->map, ckey, &cslot) &&
+			    cslot < sys->pool_capacity && sys->pool_meta[cslot].state == 1 &&
+			    (sys->pool_meta[cslot].active_view_mask & view_mask) != 0) {
+				kids_were_active = true;
+				break;
+			}
+		}
+		/* If children were already active in this view, keep them split down to (1 - hyst);
+		 * if this node was unsplit, require (1 + hyst) before splitting. */
+		node_thresh *= kids_were_active ? (1.0f - hyst) : (1.0f + hyst);
+	}
+	return (node_thresh > 1e-5f) ? (cand->proj_w / node_thresh) : 0.0f;
+}
+
+static inline bool ar_heap_better(const ar_candidate_t *cands, uint32_t a, uint32_t b)
+{
+	float ra = cands[a].split_ratio;
+	float rb = cands[b].split_ratio;
+	if (ra != rb)
+		return ra > rb;
+	float da = cands[a].dist_sq;
+	float db = cands[b].dist_sq;
+	if (da != db)
+		return da < db;
+	return a < b;
+}
+
+static inline void ar_heap_push(const ar_candidate_t *cands, uint32_t *heap,
+                                size_t *heap_len, uint32_t idx)
+{
+	size_t i = (*heap_len)++;
+	heap[i] = idx;
+	while (i > 0) {
+		size_t p = (i - 1u) >> 1;
+		if (!ar_heap_better(cands, heap[i], heap[p]))
+			break;
+		uint32_t tmp = heap[p];
+		heap[p] = heap[i];
+		heap[i] = tmp;
+		i = p;
+	}
+}
+
+static inline uint32_t ar_heap_pop(const ar_candidate_t *cands, uint32_t *heap,
+                                   size_t *heap_len)
+{
+	uint32_t top = heap[0];
+	size_t n = --(*heap_len);
+	if (n == 0)
+		return top;
+	heap[0] = heap[n];
+	size_t i = 0;
+	for (;;) {
+		size_t l = (i << 1) + 1u;
+		if (l >= n)
+			break;
+		size_t r = l + 1u;
+		size_t best = (r < n && ar_heap_better(cands, heap[r], heap[l])) ? r : l;
+		if (!ar_heap_better(cands, heap[best], heap[i]))
+			break;
+		uint32_t tmp = heap[i];
+		heap[i] = heap[best];
+		heap[best] = tmp;
+		i = best;
+	}
+	return top;
 }
 
 static inline bool ar_occ_test_padded(ar_occluder_t *occ,
@@ -2243,44 +2372,28 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 	}
 
-	while (cand_count > 0) {
-		int best_idx = -1;
-		float best_ratio = 1.0f;
+	uint32_t *heap = sys->heap_scratch;
+	size_t heap_len = 0;
+	uint32_t *free_slots = sys->free_scratch;
+	size_t free_count = 0;
+	size_t live_cands = cand_count;
 
-		for (size_t k = 0; k < cand_count; k++) {
-			if (!cands[k].active || cands[k].split_blocked || cands[k].level <= min_lvl)
-				continue;
-
-			float node_thresh = split_threshold;
-			if (hyst > 0.0f) {
-				uint64_t pkey = morton_quad_key(world, cands[k].level, cands[k].ox, cands[k].oy,
-				                                sys->base_w, sys->base_h);
-				bool kids_were_active = false;
-				for (uint8_t q = 0; q < 4; q++) {
-					uint64_t ckey = morton_quad_child(pkey, q);
-					uint32_t cslot = 0;
-					if (islet_quad_map_get(&sys->map, ckey, &cslot) &&
-					    cslot < sys->pool_capacity && sys->pool_meta[cslot].state == 1 &&
-					    (sys->pool_meta[cslot].active_view_mask & view_mask) != 0) {
-						kids_were_active = true;
-						break;
-					}
-				}
-				/* If children were already active in this view, keep them split down to (1 - hyst);
-				 * if this node was unsplit, require (1 + hyst) before splitting. */
-				node_thresh *= kids_were_active ? (1.0f - hyst) : (1.0f + hyst);
-			}
-
-			float ratio = (node_thresh > 1e-5f) ? (cands[k].proj_w / node_thresh) : 0.0f;
-			if (ratio > best_ratio ||
-			    (ratio == best_ratio && best_idx >= 0 && cands[k].dist_sq < cands[best_idx].dist_sq)) {
-				best_ratio = ratio;
-				best_idx = (int)k;
-			}
+	for (size_t k = 0; k < cand_count; k++) {
+		if (!cands[k].active || cands[k].level <= min_lvl) {
+			cands[k].split_ratio = 0.0f;
+			continue;
 		}
+		float ratio = ar_cand_split_ratio(sys, world, &cands[k], split_threshold, hyst, view_mask);
+		cands[k].split_ratio = ratio;
+		if (ratio > 1.0f) {
+			ar_heap_push(cands, heap, &heap_len, (uint32_t)k);
+		}
+	}
 
-		if (best_idx < 0)
-			break;
+	while (heap_len > 0) {
+		uint32_t best_idx = ar_heap_pop(cands, heap, &heap_len);
+		if (!cands[best_idx].active || cands[best_idx].split_blocked || cands[best_idx].level <= min_lvl)
+			continue;
 
 		uint8_t child_lvl = (uint8_t)(cands[best_idx].level - 1);
 		int32_t cw = sys->base_w << child_lvl;
@@ -2339,8 +2452,10 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		}
 
 		if (vis_kids == 0) {
-			/* Swap-remove dead candidate immediately so cand_count budget is never starved */
-			cands[best_idx] = cands[--cand_count];
+			/* Deactivate dead candidate and recycle its slot in O(1) without moving active indices */
+			cands[best_idx].active = false;
+			free_slots[free_count++] = best_idx;
+			live_cands--;
 			continue;
 		}
 
@@ -2361,7 +2476,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			continue;
 		}
 
-		if (cand_count + vis_kids - 1 > max_candidates) {
+		if (live_cands + vis_kids - 1 > max_candidates) {
 			cands[best_idx].split_blocked = true;
 			continue;
 		}
@@ -2373,8 +2488,14 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		bool replaced = false;
 		for (int c = 0; c < 4; c++) {
 			if (!kids[c].visible) continue;
-			size_t dst_idx = replaced ? cand_count++ : (size_t)best_idx;
-			replaced = true;
+			uint32_t dst_idx;
+			if (!replaced) {
+				dst_idx = best_idx;
+				replaced = true;
+			} else {
+				dst_idx = (free_count > 0) ? free_slots[--free_count] : (uint32_t)(cand_count++);
+				live_cands++;
+			}
 			cands[dst_idx].ox = kids[c].ox;
 			cands[dst_idx].oy = kids[c].oy;
 			cands[dst_idx].level = child_lvl;
@@ -2384,6 +2505,16 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			memcpy(cands[dst_idx].b_max, kids[c].b_max, sizeof(kids[c].b_max));
 			cands[dst_idx].active = true;
 			cands[dst_idx].split_blocked = false;
+			if (child_lvl > min_lvl) {
+				float ratio = ar_cand_split_ratio(sys, world, &cands[dst_idx],
+				                                  split_threshold, hyst, view_mask);
+				cands[dst_idx].split_ratio = ratio;
+				if (ratio > 1.0f) {
+					ar_heap_push(cands, heap, &heap_len, dst_idx);
+				}
+			} else {
+				cands[dst_idx].split_ratio = 0.0f;
+			}
 		}
 	}
 
@@ -2441,7 +2572,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			if (occ && !(opts && opts->occluder_no_write)) {
 				float texel_span = (float)((node->w > node->h) ? node->w : node->h) /
 				                   (float)((node->grid_dim > 0) ? node->grid_dim : 1u);
-				float coarse_k = (node->grid_dim < 8u) ? (float)node->grid_dim : 8.0f;
+				float coarse_k = (node->grid_dim < AR_OCC_CELL_K) ? (float)node->grid_dim : (float)AR_OCC_CELL_K;
 				float cell_span = (float)((node->w > node->h) ? node->w : node->h) / coarse_k;
 				float node_z_bias = opts->occluder_z_bias +
 				                    texel_span * opts->occluder_texel_bias +
@@ -2800,13 +2931,9 @@ static inline float ar_eval_interp_weight(const ar_system_t *sys, float t)
 	return ar_eval_mode_weight(sys->interp_mode, t);
 }
 
-static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t world,
-                              int32_t wx, int32_t wy, uint8_t max_ancestor_override,
-                              ar_sample_t *out)
+static const ar_node_t *ar_probe_find_node(ar_system_t *sys, uint32_t view_mask, uint16_t world,
+                                           int32_t wx, int32_t wy, uint8_t max_ancestor_override)
 {
-	if (!sys || !out)
-		return false;
-
 	uint64_t key0 = morton_quad_key(world, 0, wx, wy, sys->base_w, sys->base_h);
 	uint8_t max_lvl = (sys->max_levels > 0) ? (uint8_t)(sys->max_levels - 1) : 16;
 	const ar_node_t *best_node = NULL;
@@ -2840,6 +2967,62 @@ static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t wor
 			}
 		}
 	}
+	return best_node;
+}
+
+static bool ar_probe_val_internal(ar_system_t *sys, uint32_t view_mask, uint16_t world,
+                                  int32_t wx, int32_t wy, uint8_t max_ancestor_override,
+                                  int16_t *out_val)
+{
+	if (!sys || !out_val)
+		return false;
+
+	const ar_node_t *best_node = ar_probe_find_node(sys, view_mask, world, wx, wy, max_ancestor_override);
+	if (best_node) {
+		int gdim = (int)sys->grid_dim;
+		int vdim = (int)sys->vert_dim;
+		float fx = ((float)(wx - best_node->ox) / (float)best_node->w) * (float)gdim;
+		float fy = ((float)(wy - best_node->oy) / (float)best_node->h) * (float)gdim;
+
+		int col0 = (int)fx;
+		int row0 = (int)fy;
+		if (col0 < 0) col0 = 0;
+		if (col0 >= gdim) col0 = gdim - 1;
+		if (row0 < 0) row0 = 0;
+		if (row0 >= gdim) row0 = gdim - 1;
+
+		float u = fx - (float)col0;
+		float v = fy - (float)row0;
+		if (u < 0.0f) u = 0.0f;
+		if (u > 1.0f) u = 1.0f;
+		if (v < 0.0f) v = 0.0f;
+		if (v > 1.0f) v = 1.0f;
+		float wu = ar_eval_interp_weight(sys, u);
+		float wv = ar_eval_interp_weight(sys, v);
+
+		const int16_t *r0 = &best_node->values[row0 * vdim + col0];
+		const int16_t *r1 = r0 + vdim;
+		float h0 = (float)r0[0] * (1.0f - wu) + (float)r0[1] * wu;
+		float h1 = (float)r1[0] * (1.0f - wu) + (float)r1[1] * wu;
+		float h  = h0 * (1.0f - wv) + h1 * wv;
+		*out_val = (int16_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
+		return true;
+	}
+
+	ar_sample_t tmp;
+	sys->sampler(sys->user_ctx, world, 0, wx, wy, &tmp);
+	*out_val = tmp.val;
+	return true;
+}
+
+static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t world,
+                              int32_t wx, int32_t wy, uint8_t max_ancestor_override,
+                              ar_sample_t *out)
+{
+	if (!sys || !out)
+		return false;
+
+	const ar_node_t *best_node = ar_probe_find_node(sys, view_mask, world, wx, wy, max_ancestor_override);
 
 	if (best_node) {
 		int gdim = (int)sys->grid_dim;
@@ -2954,6 +3137,21 @@ bool ar_system_probe(ar_system_t *sys, uint16_t world,
                      ar_sample_t *out)
 {
 	return ar_probe_internal(sys, 0, world, wx, wy, 0, out);
+}
+
+bool ar_system_probe_val(ar_system_t *sys, uint16_t world,
+                         int32_t wx, int32_t wy,
+                         int16_t *out_val)
+{
+	return ar_probe_val_internal(sys, 0, world, wx, wy, 0, out_val);
+}
+
+bool ar_system_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                              int32_t wx, int32_t wy,
+                              int16_t *out_val)
+{
+	uint32_t view_mask = 1u << (view_id & 31u);
+	return ar_probe_val_internal(sys, view_mask, world, wx, wy, 0, out_val);
 }
 
 float ar_system_get_value_scale(const ar_system_t *sys)

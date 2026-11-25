@@ -202,6 +202,8 @@ typedef struct {
 	struct stl_wq   *wq;                   /* Optional workqueue pool for async background chunk population */
 } ar_config_t;
 
+#define AR_OCC_CELL_K 4u
+
 /* Represents an active node in the hierarchical system (public read-only view) */
 typedef struct {
 	int32_t            ox, oy;          /* Bottom-left origin in world units */
@@ -215,6 +217,10 @@ typedef struct {
 	uint16_t           grid_dim;        /* Runtime grid_dim for this node */
 	uint16_t           vert_dim;        /* Runtime vert_dim (grid_dim + 1) */
 	uint32_t           vert_count;      /* Runtime vert_count (vert_dim * vert_dim) */
+
+	/* Precomputed coarse conservative cell minima for fast software occlusion */
+	uint8_t            occ_grid_k;      /* 0 = uncomputed, else <= AR_OCC_CELL_K */
+	int16_t            occ_cell_min[AR_OCC_CELL_K * AR_OCC_CELL_K];
 
 	/* Read-only pointers into the single contiguous arena allocated by ar_system_create_ex */
 	const int16_t     *values;          /* [vert_count] scalar values for zero-copy GPU upload */
@@ -419,6 +425,14 @@ bool ar_system_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
                           int32_t wx, int32_t wy,
                           ar_sample_t *out);
 
+bool ar_system_probe_val(ar_system_t *sys, uint16_t world,
+                         int32_t wx, int32_t wy,
+                         int16_t *out_val);
+
+bool ar_system_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                              int32_t wx, int32_t wy,
+                              int16_t *out_val);
+
 const ar_node_t *ar_system_find(ar_system_t *sys, uint16_t world,
                                 uint8_t level, int32_t ox, int32_t oy);
 
@@ -511,6 +525,20 @@ static inline bool ar_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t wor
                                  ar_sample_t *out)
 {
 	return ar_system_probe_view(sys, view_id, world, wx, wy, out);
+}
+
+static inline bool ar_probe_val(ar_system_t *sys, uint16_t world,
+                                int32_t wx, int32_t wy,
+                                int16_t *out_val)
+{
+	return ar_system_probe_val(sys, world, wx, wy, out_val);
+}
+
+static inline bool ar_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
+                                     int32_t wx, int32_t wy,
+                                     int16_t *out_val)
+{
+	return ar_system_probe_view_val(sys, view_id, world, wx, wy, out_val);
 }
 
 static inline float ar_value_to_float_ex(int16_t val, float scale)

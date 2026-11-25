@@ -1962,6 +1962,81 @@ int main(void)
 		       cnt_wide, cnt_tight);
 	}
 
+	/* 31. Height-Only Probe Parity (ar_probe_val / ar_probe_view_val) & Precomputed occ_cell_min Cache */
+	{
+		ar_config_t p_cfg = {
+			.base_w = 160, .base_h = 128, .grid_dim = 16,
+			.pool_capacity = 128, .max_active = 64, .max_levels = 6,
+			.z_min = -600.0f, .z_max = 900.0f,
+			.target_quad_px = 4.0f,
+			.split_hysteresis = 0.12f,
+			.sampler = high_relief_sampler
+		};
+		ar_system_t *p_sys = ar_system_create_ex(&p_cfg);
+		assert(p_sys != NULL);
+
+		ar_view_t pv = {
+			.cam_x = 80.0f, .cam_y = 64.0f, .cam_z = 50.0f,
+			.pitch = 0.785398f, .yaw = 0.25f, .fov = 0.785398f,
+			.zoom = 1.0f, .viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.eff_cam_dist = 320.0f
+		};
+		const ar_node_t *vis[64];
+		size_t cnt1 = ar_system_update(p_sys, 1, &pv, vis, 64);
+		assert(cnt1 > 0);
+		/* Run a second frame with hysteresis active to exercise hoisted split_ratio + max-heap */
+		size_t cnt2 = ar_system_update(p_sys, 1, &pv, vis, 64);
+		assert(cnt2 == cnt1);
+
+		/* Verify occ_cell_min matches exact brute-force scan over node->values */
+		for (size_t i = 0; i < cnt2; i++) {
+			const ar_node_t *n = vis[i];
+			uint32_t K = (n->grid_dim < AR_OCC_CELL_K) ? n->grid_dim : AR_OCC_CELL_K;
+			assert(n->occ_grid_k == K);
+			uint32_t s[AR_OCC_CELL_K + 1u];
+			for (uint32_t c = 0; c <= K; c++) s[c] = (c * n->grid_dim) / K;
+			for (uint32_t gr = 0; gr < K; gr++) {
+				for (uint32_t gc = 0; gc < K; gc++) {
+					int16_t mn = 32767;
+					for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
+						for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
+							int16_t v = n->values[vy * n->vert_dim + vx];
+							if (v < mn) mn = v;
+						}
+					}
+					assert(n->occ_cell_min[gr * K + gc] == mn);
+					assert(n->occ_cell_min[gr * K + gc] >= n->min_val);
+				}
+			}
+		}
+
+		/* Verify exact bit-for-bit parity of ar_probe_val / ar_probe_view_val vs ar_probe / ar_probe_view */
+		for (int dy = -600; dy <= 600; dy += 37) {
+			for (int dx = -600; dx <= 600; dx += 41) {
+				ar_sample_t full;
+				int16_t val_only = 0;
+				assert(ar_probe(p_sys, 1, dx, dy, &full));
+				assert(ar_probe_val(p_sys, 1, dx, dy, &val_only));
+				assert(val_only == full.val);
+
+				assert(ar_probe_view(p_sys, 0, 1, dx, dy, &full));
+				assert(ar_probe_view_val(p_sys, 0, 1, dx, dy, &val_only));
+				assert(val_only == full.val);
+			}
+		}
+		/* Also verify uncached far coordinate fallback parity */
+		{
+			ar_sample_t full;
+			int16_t val_only = 0;
+			assert(ar_probe_view(p_sys, 0, 1, 99999, -88888, &full));
+			assert(ar_probe_view_val(p_sys, 0, 1, 99999, -88888, &val_only));
+			assert(val_only == full.val);
+		}
+
+		ar_system_destroy(p_sys);
+		printf("  [PASS] ar_probe_val / ar_probe_view_val exact parity & occ_cell_min[16] cache verified\n");
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;
