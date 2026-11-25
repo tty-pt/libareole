@@ -18,13 +18,23 @@ wasm: sync-npm-headers ${wasmtarget}
 	@install -m 644 npm/dist/areole.wasm npm/dist/chunk.wasm
 	@if [ -d ../libchunk/npm/dist ]; then install -m 644 npm/dist/areole.wasm ../libchunk/npm/dist/chunk.wasm; fi
 
-test: all bin/test_areole${EXE} bin/test_glsl${EXE}
+AREOLE_PART_SRCS := src/areole.c src/areole_internal.h src/ar_math.c src/ar_occ.c src/ar_pool.c src/ar_populate.c src/ar_solver.c src/ar_probe.c
+
+test: all bin/test_areole${EXE} bin/test_glsl${EXE} bin/bench_areole${EXE}
 	./bin/test_areole${EXE}
 	./bin/test_glsl${EXE}
+	./bin/bench_areole${EXE}
 
-bin/test_areole${EXE}: tests/test_areole.c src/areole.c include/ttypt/areole.h
+bench: all bin/bench_areole${EXE}
+	./bin/bench_areole${EXE}
+
+bin/test_areole${EXE}: tests/test_areole.c $(AREOLE_PART_SRCS) include/ttypt/areole.h
 	@mkdir -p bin
 	${cc} ${CFLAGS} -o $@ tests/test_areole.c src/areole.c ../libstele/src/stele_wq.c -lm -lpthread
+
+bin/bench_areole${EXE}: tests/bench_areole.c $(AREOLE_PART_SRCS) include/ttypt/areole.h
+	@mkdir -p bin
+	${cc} ${CFLAGS} -o $@ tests/bench_areole.c src/areole.c ../libstele/src/stele_wq.c -lm -lpthread
 
 bin/test_glsl${EXE}: tests/test_glsl.c include/ttypt/areole_glsl.h
 	@mkdir -p bin

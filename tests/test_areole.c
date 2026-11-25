@@ -1167,6 +1167,70 @@ int main(void)
 		printf("  [PASS] Progressive per-query population budget (max_populates_per_query=8) verified\n");
 	}
 
+	/* Test 20b: Budgeted query preserves 100% of already-cached fine leaves (no ancestor-trap) */
+	{
+		ar_system_t *bcs = ar_create(160, 128, TEST_GRID_DIM, TEST_POOL_CAP, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                             mock_sampler, NULL);
+		assert(bcs != NULL);
+
+		float eye[3] = { 0.0f, 900.0f, 1200.0f };
+		float target[3] = { 0.0f, 0.0f, 0.0f };
+		float up[3] = { 0.0f, -1.0f, 0.0f };
+		float mv[16], proj[16], mvp[16];
+		ar_mat4_lookat(mv, eye, target, up);
+		ar_mat4_perspective(proj, 0.785398f, 16.0f / 9.0f, 2.0f, 200000.0f);
+		ar_mat4_multiply(mvp, proj, mv);
+
+		ar_cull_opts_t opts_full = {
+			.z_min = -500.0f, .z_max = 500.0f,
+			.focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 100.0f, .target_quad_px = 2.0f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 0, .max_level = 10,
+			.view_id = 0,
+			.max_populates_per_query = 0
+		};
+
+		/* Prime exact fine leaves (intermediates above them are NOT cached) */
+		const ar_node_t *nodes_full[TEST_MAX_ACTIVE];
+		size_t n_full = ar_system_query_matrix(bcs, 1, mvp, &opts_full, nodes_full, TEST_MAX_ACTIVE);
+		assert(n_full >= 16);
+
+		ar_stats_t st_pre;
+		ar_system_get_stats(bcs, &st_pre);
+
+		/* Re-query identical view with tight max_populates_per_query=4:
+		 * Must hit 100% of already-cached fine leaves with 0 misses and 0 ancestor-trapping */
+		ar_cull_opts_t opts_tight = opts_full;
+		opts_tight.max_populates_per_query = 4;
+		ar_system_begin_frame(bcs);
+		const ar_node_t *nodes_tight[TEST_MAX_ACTIVE];
+		size_t n_tight = ar_system_query_matrix(bcs, 1, mvp, &opts_tight, nodes_tight, TEST_MAX_ACTIVE);
+		ar_stats_t st_post;
+		ar_system_get_stats(bcs, &st_post);
+		assert(n_tight == n_full);
+		assert(st_post.cache_misses_total == st_pre.cache_misses_total);
+
+		/* Verify zero spatial overlaps across all returned leaves */
+		for (size_t i = 0; i < n_tight; i++) {
+			int64_t ix0 = nodes_tight[i]->ox;
+			int64_t iy0 = nodes_tight[i]->oy;
+			int64_t ix1 = ix0 + nodes_tight[i]->w;
+			int64_t iy1 = iy0 + nodes_tight[i]->h;
+			for (size_t j = i + 1; j < n_tight; j++) {
+				int64_t jx0 = nodes_tight[j]->ox;
+				int64_t jy0 = nodes_tight[j]->oy;
+				int64_t jx1 = jx0 + nodes_tight[j]->w;
+				int64_t jy1 = jy0 + nodes_tight[j]->h;
+				int overlaps = (ix0 < jx1 && ix1 > jx0 && iy0 < jy1 && iy1 > jy0);
+				assert(!overlaps);
+			}
+		}
+
+		ar_destroy(bcs);
+		printf("  [PASS] Budgeted query preserves 100%% of cached fine leaves (%zu nodes, 0 misses, 0 overlaps)\n", n_tight);
+	}
+
 	/* 21. Multi-scale LOD texel span helper (ar_level_texel_span) */
 	{
 		float span0 = ar_level_texel_span(160, 32, 0);

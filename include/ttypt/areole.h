@@ -766,6 +766,74 @@ typedef struct {
 
 void ar_system_get_stats(const ar_system_t *sys, ar_stats_t *out_stats);
 
+#define AR_METRICS_MAX_LEVELS 18u
+
+/* Detailed per-frame and structural telemetry for profiling and regression gates */
+typedef struct {
+	/* Frame cache health */
+	uint32_t frame_hits;
+	uint32_t frame_misses;
+	uint32_t frame_populates;
+	uint32_t frame_evictions;
+	uint32_t frame_active_evictions;
+	uint32_t frame_samples_evictions;
+	uint32_t frame_deferred_active;
+	uint32_t frame_deferred_upgrades;
+
+	/* Sampler & hierarchy reuse efficiency */
+	uint32_t frame_row_sampler_calls;
+	uint32_t frame_scalar_sampler_calls;
+	uint32_t frame_verts_sampled;
+	uint32_t frame_verts_reused_parent;
+	uint32_t frame_verts_reused_child;
+
+	/* Backing spatial hash map health (from libislet) */
+	uint32_t map_capacity;
+	uint32_t map_live_entries;
+	uint32_t map_tombstones;
+	uint32_t map_max_cluster_len;
+	uint32_t frame_map_lookups;
+	uint32_t frame_map_probe_steps;
+
+	/* LOD solver & hysteresis */
+	uint32_t frame_cands_evaluated;
+	uint32_t frame_splits;
+	uint32_t frame_split_blocks_budget;
+	uint32_t frame_split_blocks_cap;
+	uint32_t frame_hysteresis_holds;
+	uint32_t level_active[AR_METRICS_MAX_LEVELS];
+	uint32_t level_populates[AR_METRICS_MAX_LEVELS];
+
+	/* Culling & software Hi-Z occluder */
+	uint32_t frame_frustum_culled;
+	uint32_t frame_cull3d_culled;
+	uint32_t frame_occ_tested;
+	uint32_t frame_occ_culled;
+	uint32_t frame_occ_nodes_rasterized;
+	uint32_t frame_occ_tris_rasterized;
+
+	/* Probes */
+	uint32_t frame_probes;
+	uint32_t frame_probe_hash_lookups;
+	uint32_t frame_probe_sampler_fallbacks;
+
+	/* Optional microsecond phase timings (enabled via ar_system_set_timing_enabled) */
+	uint32_t us_query_total;
+	uint32_t us_populate;
+	uint32_t us_occ_raster;
+	uint32_t us_occ_test;
+	uint32_t us_probe;
+
+	/* Memory footprint */
+	size_t   arena_bytes;
+	size_t   map_bytes;
+	size_t   staging_bytes;
+} ar_metrics_t;
+
+void ar_system_get_metrics(const ar_system_t *sys, ar_metrics_t *out_metrics);
+void ar_system_reset_frame_metrics(ar_system_t *sys);
+void ar_system_set_timing_enabled(ar_system_t *sys, bool enabled);
+
 #ifdef __cplusplus
 }
 #endif
