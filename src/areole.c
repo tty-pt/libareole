@@ -839,6 +839,7 @@ typedef struct {
 	uint32_t       last_touch_frame;
 	uint32_t       active_view_mask;
 	uint8_t        state;
+	int32_t        sample_slot;
 #ifdef TTYPT_WQ_H
 	stl_wq_task_t  async_task;
 	struct ar_system *async_sys;
@@ -866,6 +867,9 @@ struct ar_system {
 	uint16_t          vert_dim;
 	uint32_t          vert_count;
 	uint16_t          pool_capacity;
+	uint16_t          samples_pool_capacity;
+	uint8_t           samples_max_level;
+	bool              samples_bounded;
 	uint16_t          max_active;
 	uint8_t           max_levels;
 	uint32_t          default_rgba;
@@ -913,6 +917,10 @@ struct ar_system {
 	ar_candidate_t   *active_cands_scratch;
 	uint32_t         *heap_scratch;
 	uint32_t         *free_scratch;
+	uint8_t          *samples_arena;
+	size_t            per_node_samples_stride;
+	int32_t          *sample_owner;
+	ar_sample_t      *row_scratch;
 	size_t            active_count;
 	uint8_t          *staging_arena;
 
@@ -1109,6 +1117,8 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	uint16_t vert_dim = (uint16_t)(grid_dim + 1u);
 	uint32_t vert_count = (uint32_t)vert_dim * (uint32_t)vert_dim;
 	uint16_t pool_cap = cfg->pool_capacity;
+	bool samples_bounded = (cfg->samples_pool_capacity > 0 && cfg->samples_pool_capacity < pool_cap);
+	uint16_t samples_cap = samples_bounded ? cfg->samples_pool_capacity : pool_cap;
 	uint16_t max_act = cfg->max_active;
 	uint8_t max_lvls = cfg->max_levels;
 	uint32_t def_rgba = cfg->default_rgba;
@@ -1121,15 +1131,19 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	size_t active_cands_bytes = ar_align8((size_t)max_act * sizeof(ar_candidate_t));
 	size_t heap_bytes = ar_align8((size_t)(max_act + 8u) * sizeof(uint32_t));
 	size_t free_bytes = ar_align8((size_t)(max_act + 8u) * sizeof(uint32_t));
+	size_t sample_owner_bytes = samples_bounded ? ar_align8((size_t)samples_cap * sizeof(int32_t)) : 0u;
+	size_t row_scratch_bytes = samples_bounded ? ar_align8((size_t)vert_dim * sizeof(ar_sample_t)) : 0u;
 
 	size_t per_node_vals = ar_align8((size_t)vert_count * sizeof(int16_t));
 	size_t per_node_rgba = ar_align8((size_t)vert_count * sizeof(uint32_t));
 	size_t per_node_samples = ar_align8((size_t)vert_count * sizeof(ar_sample_t));
-	size_t per_node_arena = per_node_vals + per_node_rgba + per_node_samples;
+	size_t per_node_gpu_arena = per_node_vals + per_node_rgba;
 
 	size_t total_bytes = sys_bytes + pool_bytes + pool_meta_bytes + active_bytes +
 	                     cands_bytes + active_cands_bytes + heap_bytes + free_bytes +
-	                     (size_t)pool_cap * per_node_arena;
+	                     sample_owner_bytes + row_scratch_bytes +
+	                     (size_t)pool_cap * per_node_gpu_arena +
+	                     (size_t)samples_cap * per_node_samples;
 
 	uint8_t *arena = (uint8_t *)calloc(1, total_bytes);
 	if (!arena)
@@ -1159,6 +1173,18 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->free_scratch = (uint32_t *)cursor;
 	cursor += free_bytes;
 
+	if (samples_bounded) {
+		sys->sample_owner = (int32_t *)cursor;
+		cursor += sample_owner_bytes;
+		for (uint16_t k = 0; k < samples_cap; k++)
+			sys->sample_owner[k] = -1;
+		sys->row_scratch = (ar_sample_t *)cursor;
+		cursor += row_scratch_bytes;
+	} else {
+		sys->sample_owner = NULL;
+		sys->row_scratch = NULL;
+	}
+
 	for (uint16_t i = 0; i < pool_cap; i++) {
 		sys->pool[i].grid_dim = grid_dim;
 		sys->pool[i].vert_dim = vert_dim;
@@ -1167,8 +1193,17 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 		cursor += per_node_vals;
 		sys->pool[i].rgba = (const uint32_t *)cursor;
 		cursor += per_node_rgba;
-		sys->pool[i].samples = (const ar_sample_t *)cursor;
-		cursor += per_node_samples;
+		sys->pool[i].samples = NULL;
+		sys->pool_meta[i].sample_slot = -1;
+	}
+
+	sys->samples_arena = cursor;
+	sys->per_node_samples_stride = per_node_samples;
+	if (!samples_bounded) {
+		for (uint16_t i = 0; i < pool_cap; i++) {
+			sys->pool[i].samples = (const ar_sample_t *)(sys->samples_arena + (size_t)i * per_node_samples);
+			sys->pool_meta[i].sample_slot = (int32_t)i;
+		}
 	}
 
 	float val_scale = (cfg->value_scale > 0.0f) ? cfg->value_scale : AR_DEFAULT_VALUE_SCALE;
@@ -1179,6 +1214,9 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->vert_dim = vert_dim;
 	sys->vert_count = vert_count;
 	sys->pool_capacity = pool_cap;
+	sys->samples_pool_capacity = samples_cap;
+	sys->samples_max_level = cfg->samples_max_level;
+	sys->samples_bounded = samples_bounded;
 	sys->max_active = max_act;
 	sys->max_levels = max_lvls;
 	sys->default_rgba = def_rgba;
@@ -1232,6 +1270,7 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->stats.pool_capacity = pool_cap;
 	sys->stats.min_level_observed = 255;
 	sys->stats.max_level_observed = 0;
+	sys->stats.arena_bytes = total_bytes;
 
 	return sys;
 }
@@ -1411,6 +1450,84 @@ void ar_system_destroy(ar_system_t *sys)
 	free(sys);
 }
 
+static void ar_node_release_samples(ar_system_t *sys, int slot)
+{
+	if (!sys || !sys->samples_bounded || slot < 0 || slot >= (int)sys->pool_capacity)
+		return;
+	int32_t sslot = sys->pool_meta[slot].sample_slot;
+	if (sslot >= 0 && sslot < (int32_t)sys->samples_pool_capacity) {
+		if (sys->sample_owner[sslot] == slot)
+			sys->sample_owner[sslot] = -1;
+	}
+	sys->pool_meta[slot].sample_slot = -1;
+	sys->pool[slot].samples = NULL;
+}
+
+static void ar_node_bind_samples(ar_system_t *sys, int slot, uint8_t level)
+{
+	if (!sys || !sys->samples_bounded || slot < 0 || slot >= (int)sys->pool_capacity)
+		return;
+	if (level > sys->samples_max_level) {
+		ar_node_release_samples(sys, slot);
+		return;
+	}
+	if (sys->pool_meta[slot].sample_slot >= 0) {
+		sys->pool[slot].samples = (const ar_sample_t *)(sys->samples_arena +
+			(size_t)sys->pool_meta[slot].sample_slot * sys->per_node_samples_stride);
+		return;
+	}
+
+	int32_t chosen = -1;
+	for (uint16_t k = 0; k < sys->samples_pool_capacity; k++) {
+		if (sys->sample_owner[k] < 0) {
+			chosen = (int32_t)k;
+			break;
+		}
+	}
+	if (chosen < 0) {
+		/* Prefer LRU inactive owner; fallback to oldest owner overall */
+		uint32_t oldest_inactive = 0xFFFFFFFFu;
+		int32_t best_inactive = -1;
+		uint32_t oldest_any = 0xFFFFFFFFu;
+		int32_t best_any = -1;
+		for (uint16_t k = 0; k < sys->samples_pool_capacity; k++) {
+			int32_t owner = sys->sample_owner[k];
+			if (owner < 0 || owner >= (int32_t)sys->pool_capacity || owner == slot)
+				continue;
+#ifdef TTYPT_WQ_H
+			if (stl_wq_busy(&sys->pool_meta[owner].async_task))
+				continue;
+#endif
+			uint32_t tick = sys->pool_meta[owner].last_used_tick;
+			if (sys->pool_meta[owner].active_view_mask == 0 && tick < oldest_inactive) {
+				oldest_inactive = tick;
+				best_inactive = (int32_t)k;
+			}
+			if (tick < oldest_any) {
+				oldest_any = tick;
+				best_any = (int32_t)k;
+			}
+		}
+		chosen = (best_inactive >= 0) ? best_inactive : best_any;
+		if (chosen >= 0) {
+			int32_t prev_owner = sys->sample_owner[chosen];
+			if (prev_owner >= 0 && prev_owner < (int32_t)sys->pool_capacity) {
+				sys->pool_meta[prev_owner].sample_slot = -1;
+				sys->pool[prev_owner].samples = NULL;
+			}
+		}
+	}
+	if (chosen >= 0) {
+		sys->sample_owner[chosen] = slot;
+		sys->pool_meta[slot].sample_slot = chosen;
+		sys->pool[slot].samples = (const ar_sample_t *)(sys->samples_arena +
+			(size_t)chosen * sys->per_node_samples_stride);
+	} else {
+		sys->pool_meta[slot].sample_slot = -1;
+		sys->pool[slot].samples = NULL;
+	}
+}
+
 void ar_system_clear(ar_system_t *sys)
 {
 	if (!sys)
@@ -1428,6 +1545,14 @@ void ar_system_clear(ar_system_t *sys)
 		sys->pool_meta[i].state = 0;
 		sys->pool_meta[i].last_used_tick = 0;
 		sys->pool_meta[i].active_view_mask = 0;
+		if (sys->samples_bounded) {
+			sys->pool_meta[i].sample_slot = -1;
+			sys->pool[i].samples = NULL;
+		}
+	}
+	if (sys->samples_bounded && sys->sample_owner) {
+		for (uint16_t k = 0; k < sys->samples_pool_capacity; k++)
+			sys->sample_owner[k] = -1;
 	}
 	islet_quad_map_clear(&sys->map);
 	sys->active_count = 0;
@@ -1457,7 +1582,8 @@ void ar_system_begin_frame(ar_system_t *sys)
 				    (node->flags & AR_NODE_FLAG_DEFERRED)) {
 					memcpy((int16_t *)node->values, meta->staging_values, vals_bytes);
 					memcpy((uint32_t *)node->rgba, meta->staging_rgba, rgba_bytes);
-					memcpy((ar_sample_t *)node->samples, meta->staging_samples, samp_bytes);
+					if (node->samples && meta->staging_samples)
+						memcpy((ar_sample_t *)node->samples, meta->staging_samples, samp_bytes);
 					node->min_val = meta->async_min_val;
 					node->max_val = meta->async_max_val;
 					node->flags = meta->async_flags;
@@ -1582,6 +1708,8 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		islet_quad_map_put(&sys->map, key, (uint32_t)slot);
 	}
 
+	ar_node_bind_samples(sys, slot, level);
+
 	/* 3. Query sparsity if provider supplied */
 	if (sys->sparsity) {
 		if (sys->sparsity(sys->user_ctx, world, level, ox, oy, node->w, node->h)) {
@@ -1638,10 +1766,12 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	 * synthesize node geometry/texture via O(1) integer bilinear upsampling without stalling */
 	bool budget_exceeded = (sys->max_populates_per_frame > 0 &&
 	                        sys->frame_populates_count >= sys->max_populates_per_frame);
-	if (budget_exceeded && parent_node) {
+	if (budget_exceeded && parent_node && (!mut_samples || parent_node->samples != NULL)) {
 		size_t idx = 0;
 		int vdim_p = (int32_t)parent_node->vert_dim;
 		const ar_sample_t *ps = parent_node->samples;
+		const int16_t *pv = parent_node->values;
+		const uint32_t *pc_arr = parent_node->rgba;
 		for (int r = 0; r <= gdim; r++) {
 			int r_even = ((r & 1) == 0);
 			int pr0 = parent_r_off + (r >> 1);
@@ -1653,47 +1783,74 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 				int pc1 = c_even ? pc0 : (pc0 + 1);
 				if (pc1 > gdim) pc1 = gdim;
 
-				ar_sample_t *s = &mut_samples[idx];
-				if (r_even && c_even) {
-					*s = ps[pr0 * vdim_p + pc0];
-				} else if (r_even) {
-					const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
-					const ar_sample_t *s1 = &ps[pr0 * vdim_p + pc1];
-					s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
-					s->flags = s0->flags | s1->flags;
-					s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
-					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
-						s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
+				int16_t v_out;
+				uint32_t rgba_out;
+				if (mut_samples) {
+					ar_sample_t *s = &mut_samples[idx];
+					if (r_even && c_even) {
+						*s = ps[pr0 * vdim_p + pc0];
+					} else if (r_even) {
+						const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
+						const ar_sample_t *s1 = &ps[pr0 * vdim_p + pc1];
+						s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+						s->flags = s0->flags | s1->flags;
+						s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
+						for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+							s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
+						}
+					} else if (c_even) {
+						const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
+						const ar_sample_t *s1 = &ps[pr1 * vdim_p + pc0];
+						s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+						s->flags = s0->flags | s1->flags;
+						s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
+						for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+							s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
+						}
+					} else {
+						const ar_sample_t *s00 = &ps[pr0 * vdim_p + pc0];
+						const ar_sample_t *s10 = &ps[pr0 * vdim_p + pc1];
+						const ar_sample_t *s01 = &ps[pr1 * vdim_p + pc0];
+						const ar_sample_t *s11 = &ps[pr1 * vdim_p + pc1];
+						s->val = (int16_t)(((int32_t)s00->val + (int32_t)s10->val + (int32_t)s01->val + (int32_t)s11->val) >> 2);
+						s->flags = s00->flags | s10->flags | s01->flags | s11->flags;
+						s->rgba = (((s00->rgba & 0xFCFCFCFCu) >> 2) + ((s10->rgba & 0xFCFCFCFCu) >> 2) +
+						           ((s01->rgba & 0xFCFCFCFCu) >> 2) + ((s11->rgba & 0xFCFCFCFCu) >> 2));
+						for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
+							s->attr[a] = (uint8_t)(((uint16_t)s00->attr[a] + (uint16_t)s10->attr[a] +
+							                        (uint16_t)s01->attr[a] + (uint16_t)s11->attr[a]) >> 2);
+						}
 					}
-				} else if (c_even) {
-					const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
-					const ar_sample_t *s1 = &ps[pr1 * vdim_p + pc0];
-					s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
-					s->flags = s0->flags | s1->flags;
-					s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
-					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
-						s->attr[a] = (uint8_t)(((uint16_t)s0->attr[a] + (uint16_t)s1->attr[a]) >> 1);
-					}
+					v_out = s->val;
+					rgba_out = s->rgba ? s->rgba : sys->default_rgba;
+					node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
 				} else {
-					const ar_sample_t *s00 = &ps[pr0 * vdim_p + pc0];
-					const ar_sample_t *s10 = &ps[pr0 * vdim_p + pc1];
-					const ar_sample_t *s01 = &ps[pr1 * vdim_p + pc0];
-					const ar_sample_t *s11 = &ps[pr1 * vdim_p + pc1];
-					s->val = (int16_t)(((int32_t)s00->val + (int32_t)s10->val + (int32_t)s01->val + (int32_t)s11->val) >> 2);
-					s->flags = s00->flags | s10->flags | s01->flags | s11->flags;
-					s->rgba = (((s00->rgba & 0xFCFCFCFCu) >> 2) + ((s10->rgba & 0xFCFCFCFCu) >> 2) +
-					           ((s01->rgba & 0xFCFCFCFCu) >> 2) + ((s11->rgba & 0xFCFCFCFCu) >> 2));
-					for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
-						s->attr[a] = (uint8_t)(((uint16_t)s00->attr[a] + (uint16_t)s10->attr[a] +
-						                        (uint16_t)s01->attr[a] + (uint16_t)s11->attr[a]) >> 2);
+					if (r_even && c_even) {
+						v_out = pv[pr0 * vdim_p + pc0];
+						rgba_out = pc_arr[pr0 * vdim_p + pc0];
+					} else if (r_even) {
+						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr0 * vdim_p + pc1]) >> 1);
+						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1) +
+						            ((pc_arr[pr0 * vdim_p + pc1] & 0xFEFEFEFEu) >> 1));
+					} else if (c_even) {
+						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr1 * vdim_p + pc0]) >> 1);
+						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1) +
+						            ((pc_arr[pr1 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1));
+					} else {
+						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr0 * vdim_p + pc1] +
+						                   (int32_t)pv[pr1 * vdim_p + pc0] + (int32_t)pv[pr1 * vdim_p + pc1]) >> 2);
+						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFCFCFCFCu) >> 2) +
+						            ((pc_arr[pr0 * vdim_p + pc1] & 0xFCFCFCFCu) >> 2) +
+						            ((pc_arr[pr1 * vdim_p + pc0] & 0xFCFCFCFCu) >> 2) +
+						            ((pc_arr[pr1 * vdim_p + pc1] & 0xFCFCFCFCu) >> 2));
 					}
+					node->flags |= (parent_node->flags & AR_NODE_USER_FLAGS_MASK);
 				}
-				if (s->val < node->min_val) node->min_val = s->val;
-				if (s->val > node->max_val) node->max_val = s->val;
-				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+				if (v_out < node->min_val) node->min_val = v_out;
+				if (v_out > node->max_val) node->max_val = v_out;
 
-				mut_values[idx] = s->val;
-				mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+				mut_values[idx] = v_out;
+				mut_rgba[idx] = rgba_out;
 				idx++;
 			}
 		}
@@ -1720,18 +1877,28 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	sys->frame_populates_count++;
 	node->flags &= ~AR_NODE_FLAG_DEFERRED;
 
-	bool has_reusable_nodes = (parent_node != NULL ||
-	                           child_nodes[0] != NULL || child_nodes[1] != NULL ||
-	                           child_nodes[2] != NULL || child_nodes[3] != NULL);
+	bool has_reusable_nodes = false;
+	if (mut_samples) {
+		has_reusable_nodes = ((parent_node && parent_node->samples != NULL) ||
+		                      (child_nodes[0] && child_nodes[0]->samples != NULL) ||
+		                      (child_nodes[1] && child_nodes[1]->samples != NULL) ||
+		                      (child_nodes[2] && child_nodes[2]->samples != NULL) ||
+		                      (child_nodes[3] && child_nodes[3]->samples != NULL));
+	} else {
+		has_reusable_nodes = (parent_node != NULL ||
+		                      child_nodes[0] != NULL || child_nodes[1] != NULL ||
+		                      child_nodes[2] != NULL || child_nodes[3] != NULL);
+	}
 
 	size_t idx = 0;
 	if (sys->row_sampler && !has_reusable_nodes) {
 		for (int r = 0; r <= gdim; r++) {
 			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
-			sys->row_sampler(sys->user_ctx, world, level, wy, ox, node->w, (uint32_t)vdim, &mut_samples[idx]);
+			ar_sample_t *row_dst = mut_samples ? &mut_samples[idx] : sys->row_scratch;
+			sys->row_sampler(sys->user_ctx, world, level, wy, ox, node->w, (uint32_t)vdim, row_dst);
 			sys->stats.sampler_invocations_total += (uint32_t)vdim;
 			for (int c = 0; c <= gdim; c++) {
-				ar_sample_t *s = &mut_samples[idx];
+				ar_sample_t *s = &row_dst[c];
 				if (s->val < node->min_val) node->min_val = s->val;
 				if (s->val > node->max_val) node->max_val = s->val;
 				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
@@ -1746,7 +1913,8 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
 			for (int c = 0; c <= gdim; c++) {
 				int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
-				ar_sample_t *s = &mut_samples[idx];
+				ar_sample_t tmp_s;
+				ar_sample_t *s = mut_samples ? &mut_samples[idx] : &tmp_s;
 				bool reused = false;
 
 				/* Check cached finer child first (every grid point (c, r) in parent maps to
@@ -1756,24 +1924,37 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 					int qy = (r > half_gdim) ? 1 : 0;
 					uint8_t q = (uint8_t)(qx | (qy << 1));
 					const ar_node_t *cn = child_nodes[q];
-					if (cn) {
+					if (cn && (!mut_samples || cn->samples != NULL)) {
 						int cc = (c - (qx ? half_gdim : 0)) * 2;
 						int cr = (r - (qy ? half_gdim : 0)) * 2;
 						int32_t c_wx = cn->ox + (int32_t)(((int64_t)cc * cn->w) / gdim);
 						int32_t c_wy = cn->oy + (int32_t)(((int64_t)cr * cn->h) / gdim);
 						if (c_wx == wx && c_wy == wy) {
-							*s = cn->samples[cr * vdim + cc];
+							if (cn->samples) {
+								*s = cn->samples[cr * vdim + cc];
+							} else {
+								s->val = cn->values[cr * vdim + cc];
+								s->rgba = cn->rgba[cr * vdim + cc];
+								s->flags = cn->flags & AR_NODE_USER_FLAGS_MASK;
+							}
 							reused = true;
 						}
 					}
 					/* Otherwise check cached parent at even grid coordinates */
-					if (!reused && parent_node && ((r & 1) == 0) && ((c & 1) == 0)) {
+					if (!reused && parent_node && (!mut_samples || parent_node->samples != NULL) &&
+					    ((r & 1) == 0) && ((c & 1) == 0)) {
 						int pr = parent_r_off + (r >> 1);
 						int pc = parent_c_off + (c >> 1);
 						int32_t p_wx = parent_node->ox + (int32_t)(((int64_t)pc * parent_node->w) / gdim);
 						int32_t p_wy = parent_node->oy + (int32_t)(((int64_t)pr * parent_node->h) / gdim);
 						if (p_wx == wx && p_wy == wy) {
-							*s = parent_node->samples[pr * vdim + pc];
+							if (parent_node->samples) {
+								*s = parent_node->samples[pr * vdim + pc];
+							} else {
+								s->val = parent_node->values[pr * vdim + pc];
+								s->rgba = parent_node->rgba[pr * vdim + pc];
+								s->flags = parent_node->flags & AR_NODE_USER_FLAGS_MASK;
+							}
 							reused = true;
 						}
 					}
@@ -3049,44 +3230,64 @@ static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t wor
 		float wu = ar_eval_interp_weight(sys, u);
 		float wv = ar_eval_interp_weight(sys, v);
 
-		const ar_sample_t *s00 = &best_node->samples[row0 * vdim + col0];
-		const ar_sample_t *s10 = &best_node->samples[row0 * vdim + col1];
-		const ar_sample_t *s01 = &best_node->samples[row1 * vdim + col0];
-		const ar_sample_t *s11 = &best_node->samples[row1 * vdim + col1];
+		int idx00 = row0 * vdim + col0;
+		int idx10 = row0 * vdim + col1;
+		int idx01 = row1 * vdim + col0;
+		int idx11 = row1 * vdim + col1;
 
-		float h0 = (float)s00->val * (1.0f - wu) + (float)s10->val * wu;
-		float h1 = (float)s01->val * (1.0f - wu) + (float)s11->val * wu;
+		float h0 = (float)best_node->values[idx00] * (1.0f - wu) + (float)best_node->values[idx10] * wu;
+		float h1 = (float)best_node->values[idx01] * (1.0f - wu) + (float)best_node->values[idx11] * wu;
 		float h  = h0 * (1.0f - wv) + h1 * wv;
 		out->val = (int16_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
 
-		const ar_sample_t *s_near = (u < 0.5f)
-		                            ? ((v < 0.5f) ? s00 : s01)
-		                            : ((v < 0.5f) ? s10 : s11);
 		uint8_t n_attr = sys->attr_count;
-		bool interp_attr = sys->interpolate_attrs ||
-		                   (sys->attr_interp_mode == AR_INTERP_LINEAR) ||
-		                   (sys->attr_interp_mode == AR_INTERP_QUINTIC);
-		float awu = wu, awv = wv;
-		if (interp_attr && sys->attr_interp_mode != 0) {
-			awu = ar_eval_mode_weight(sys->attr_interp_mode, u);
-			awv = ar_eval_mode_weight(sys->attr_interp_mode, v);
-		}
-		for (uint8_t k = 0; k < AR_SAMPLE_ATTR_CAP; k++) {
-			if (k >= n_attr) {
-				out->attr[k] = 0;
-			} else if (interp_attr) {
-				float a0 = (float)s00->attr[k] * (1.0f - awu) + (float)s10->attr[k] * awu;
-				float a1 = (float)s01->attr[k] * (1.0f - awu) + (float)s11->attr[k] * awu;
-				int aval = (int)(a0 * (1.0f - awv) + a1 * awv + 0.5f);
-				if (aval < 0) aval = 0;
-				if (aval > 255) aval = 255;
-				out->attr[k] = (uint8_t)aval;
-			} else {
-				out->attr[k] = s_near->attr[k];
+		uint32_t c00, c10, c01, c11;
+		if (best_node->samples) {
+			const ar_sample_t *s00 = &best_node->samples[idx00];
+			const ar_sample_t *s10 = &best_node->samples[idx10];
+			const ar_sample_t *s01 = &best_node->samples[idx01];
+			const ar_sample_t *s11 = &best_node->samples[idx11];
+			const ar_sample_t *s_near = (u < 0.5f)
+			                            ? ((v < 0.5f) ? s00 : s01)
+			                            : ((v < 0.5f) ? s10 : s11);
+			bool interp_attr = sys->interpolate_attrs ||
+			                   (sys->attr_interp_mode == AR_INTERP_LINEAR) ||
+			                   (sys->attr_interp_mode == AR_INTERP_QUINTIC);
+			float awu = wu, awv = wv;
+			if (interp_attr && sys->attr_interp_mode != 0) {
+				awu = ar_eval_mode_weight(sys->attr_interp_mode, u);
+				awv = ar_eval_mode_weight(sys->attr_interp_mode, v);
 			}
+			for (uint8_t k = 0; k < AR_SAMPLE_ATTR_CAP; k++) {
+				if (k >= n_attr) {
+					out->attr[k] = 0;
+				} else if (interp_attr) {
+					float a0 = (float)s00->attr[k] * (1.0f - awu) + (float)s10->attr[k] * awu;
+					float a1 = (float)s01->attr[k] * (1.0f - awu) + (float)s11->attr[k] * awu;
+					int aval = (int)(a0 * (1.0f - awv) + a1 * awv + 0.5f);
+					if (aval < 0) aval = 0;
+					if (aval > 255) aval = 255;
+					out->attr[k] = (uint8_t)aval;
+				} else {
+					out->attr[k] = s_near->attr[k];
+				}
+			}
+			c00 = s00->rgba; c10 = s10->rgba; c01 = s01->rgba; c11 = s11->rgba;
+			out->flags = s_near->flags;
+		} else {
+			ar_sample_t tmp_s;
+			memset(&tmp_s, 0, sizeof(tmp_s));
+			sys->sampler(sys->user_ctx, world, best_node->level, wx, wy, &tmp_s);
+			for (uint8_t k = 0; k < AR_SAMPLE_ATTR_CAP; k++) {
+				out->attr[k] = (k < n_attr) ? tmp_s.attr[k] : 0;
+			}
+			c00 = best_node->rgba[idx00];
+			c10 = best_node->rgba[idx10];
+			c01 = best_node->rgba[idx01];
+			c11 = best_node->rgba[idx11];
+			out->flags = tmp_s.flags;
 		}
 
-		uint32_t c00 = s00->rgba, c10 = s10->rgba, c01 = s01->rgba, c11 = s11->rgba;
 		uint32_t r_b = 0, g_b = 0, b_b = 0, a_b = 0;
 		for (int ch = 0; ch < 4; ch++) {
 			int shift = ch * 8;
@@ -3106,7 +3307,6 @@ static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t wor
 			else a_b = (uint32_t)ival << 24;
 		}
 		out->rgba = r_b | g_b | b_b | a_b;
-		out->flags = s_near->flags;
 		return true;
 	}
 

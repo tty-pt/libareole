@@ -2037,6 +2037,104 @@ int main(void)
 		printf("  [PASS] ar_probe_val / ar_probe_view_val exact parity & occ_cell_min[16] cache verified\n");
 	}
 
+	/* 31. Bounded samples sub-pool (samples_pool_capacity + samples_max_level) */
+	{
+		ar_config_t full_cfg;
+		memset(&full_cfg, 0, sizeof(full_cfg));
+		full_cfg.base_w = 160;
+		full_cfg.base_h = 128;
+		full_cfg.grid_dim = 48;
+		full_cfg.pool_capacity = 512;
+		full_cfg.max_active = 160;
+		full_cfg.max_levels = 17;
+		full_cfg.sampler = mock_sampler;
+		full_cfg.default_rgba = 0xFF3C804Eu;
+		ar_system_t *full_sys = ar_system_create_ex(&full_cfg);
+		assert(full_sys != NULL);
+		ar_stats_t full_st;
+		ar_system_get_stats(full_sys, &full_st);
+
+		ar_config_t cmp_cfg = full_cfg;
+		cmp_cfg.samples_pool_capacity = 64;
+		cmp_cfg.samples_max_level = 2;
+		ar_system_t *cmp_sys = ar_system_create_ex(&cmp_cfg);
+		assert(cmp_sys != NULL);
+		ar_stats_t cmp_st;
+		ar_system_get_stats(cmp_sys, &cmp_st);
+
+		assert(full_st.arena_bytes > cmp_st.arena_bytes);
+		size_t saved = full_st.arena_bytes - cmp_st.arena_bytes;
+		/* 512 -> 64 sample slots at 49x49x20 B saves ~21.5 MB (> 20 MB) */
+		assert(saved >= 20u * 1024u * 1024u);
+
+		/* Coarse node (level 4 > samples_max_level=2) has samples == NULL, valid values/rgba */
+		const ar_node_t *coarse_full = ar_system_ensure(full_sys, 0, 4, 0, 0);
+		const ar_node_t *coarse_cmp  = ar_system_ensure(cmp_sys, 0, 4, 0, 0);
+		assert(coarse_full && coarse_full->samples != NULL);
+		assert(coarse_cmp && coarse_cmp->samples == NULL);
+		assert(coarse_cmp->values != NULL && coarse_cmp->rgba != NULL);
+		for (uint32_t i = 0; i < coarse_cmp->vert_count; i++) {
+			assert(coarse_cmp->values[i] == coarse_full->values[i]);
+			assert(coarse_cmp->rgba[i] == coarse_full->rgba[i]);
+		}
+
+		/* Fine node (level 0 <= samples_max_level=2) gets full samples & exact parity */
+		const ar_node_t *fine_full = ar_system_ensure(full_sys, 0, 0, 0, 0);
+		const ar_node_t *fine_cmp  = ar_system_ensure(cmp_sys, 0, 0, 0, 0);
+		assert(fine_cmp && fine_cmp->samples != NULL);
+		for (uint32_t i = 0; i < fine_cmp->vert_count; i++) {
+			assert(fine_cmp->values[i] == fine_full->values[i]);
+			assert(fine_cmp->rgba[i] == fine_full->rgba[i]);
+			assert(fine_cmp->samples[i].val == fine_full->samples[i].val);
+			assert(fine_cmp->samples[i].rgba == fine_full->samples[i].rgba);
+			assert(fine_cmp->samples[i].flags == fine_full->samples[i].flags);
+		}
+
+		/* Probe parity on coarse (samples == NULL) and fine (samples != NULL) nodes */
+		ar_sample_t pf, pc;
+		assert(ar_system_probe(full_sys, 0, 50, 40, &pf));
+		assert(ar_system_probe(cmp_sys, 0, 50, 40, &pc));
+		assert(pc.val == pf.val && pc.rgba == pf.rgba && pc.flags == pf.flags);
+		/* Probe far inside coarse level-4 node where level 0 doesn't cover */
+		assert(ar_system_probe_ex(full_sys, 0, 1200, 900, 6, &pf));
+		assert(ar_system_probe_ex(cmp_sys, 0, 1200, 900, 6, &pc));
+		assert(pc.val == pf.val && pc.rgba == pf.rgba);
+
+		/* LRU stealing: populate > samples_pool_capacity fine nodes on a tiny 4-slot sub-pool */
+		ar_config_t tiny_cfg = full_cfg;
+		tiny_cfg.grid_dim = 16;
+		tiny_cfg.pool_capacity = 32;
+		tiny_cfg.max_active = 16;
+		tiny_cfg.samples_pool_capacity = 4;
+		tiny_cfg.samples_max_level = 1;
+		ar_system_t *tiny_sys = ar_system_create_ex(&tiny_cfg);
+		assert(tiny_sys != NULL);
+		const ar_node_t *nodes[8];
+		for (int k = 0; k < 8; k++) {
+			ar_system_begin_frame(tiny_sys);
+			nodes[k] = ar_system_ensure(tiny_sys, 0, 0, k * 160, 0);
+			assert(nodes[k] != NULL && nodes[k]->samples != NULL);
+		}
+		/* Oldest 4 should have had samples stolen while retaining values & rgba */
+		int with_samples = 0;
+		for (int k = 0; k < 8; k++) {
+			assert(nodes[k]->values != NULL && nodes[k]->rgba != NULL);
+			if (nodes[k]->samples != NULL)
+				with_samples++;
+		}
+		assert(with_samples == 4);
+		/* Probing a stolen node still succeeds via values/rgba + sampler fallback */
+		assert(nodes[0]->samples == NULL);
+		assert(ar_system_probe(tiny_sys, 0, 80, 64, &pc));
+		ar_system_clear(tiny_sys);
+		ar_system_destroy(tiny_sys);
+
+		ar_system_destroy(cmp_sys);
+		ar_system_destroy(full_sys);
+		printf("  [PASS] Bounded samples sub-pool verified (arena %zu -> %zu bytes, saved %.2f MB)\n",
+		       full_st.arena_bytes, cmp_st.arena_bytes, (double)saved / (1024.0 * 1024.0));
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;

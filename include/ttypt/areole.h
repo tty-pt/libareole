@@ -200,6 +200,8 @@ typedef struct {
 	ar_interp_mode_t attr_interp_mode;     /* Attribute probe mode (0 or AR_INTERP_NEAREST = nearest, AR_INTERP_LINEAR/QUINTIC = continuous) */
 	bool             interpolate_attrs;    /* When true and attr_interp_mode == 0, interpolate attrs using AR_INTERP_SMOOTHSTEP */
 	struct stl_wq   *wq;                   /* Optional workqueue pool for async background chunk population */
+	uint16_t         samples_pool_capacity;/* Optional cap on nodes retaining full ar_sample_t[] (0 = pool_capacity, all nodes) */
+	uint8_t          samples_max_level;    /* Max LOD level eligible for full ar_sample_t[] when samples_pool_capacity > 0 */
 } ar_config_t;
 
 #define AR_OCC_CELL_K 4u
@@ -759,6 +761,7 @@ typedef struct {
 	size_t  cache_misses_total;
 	uint8_t max_level_observed;
 	uint8_t min_level_observed;
+	size_t  arena_bytes;
 } ar_stats_t;
 
 void ar_system_get_stats(const ar_system_t *sys, ar_stats_t *out_stats);
