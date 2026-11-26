@@ -21,14 +21,14 @@
 
 `libareole` (`@tty-pt/areole`) is a domain-agnostic spatial hierarchy and level-of-detail (LOD) culling engine for real-time 3D, 2.5D, and 2D procedural worlds:
 
-1. **Single-Arena Zero-Allocation Traversal**:
-   - Allocates the entire quadtree node pool, vertex sample buffers, and spatial hash table in a single contiguous arena at startup (`createAreoleSystem`), performing zero heap allocations during per-frame camera motion.
-2. **Rigorous 6-Plane Gribb-Hartmann & 3D Manifold Horizon Culling**:
-   - Extracts exact frustum planes from the active camera view (supporting full $360^\circ$ yaw, $0^\circ\text{–}85^\circ$ pitch, perspective/orthographic projection, planetary horizon curvature sag, and pluggable 3D manifold AABB / normal-cone horizon culling callbacks `ar_bounds_3d_fn` and `ar_cull_3d_fn`).
-3. **Coarse-First Priority LOD Selection, Scanline Batching & Async Workqueue Population ($O(1)$ Active Budget)**:
-   - Guarantees complete 4-quadrant horizon coverage within a bounded `maxActive` chunk budget while subdividing near-camera quads to target screen-space pixel density, with vectorized scanline callbacks (`ar_row_sampler_fn`), watertight cross-LOD seam welding, and background worker population (`<ttypt/wq.h>`).
-4. **Hierarchical Point & Attribute Probing (`.probe(wx, wy)`)**:
-   - Evaluates continuous interpolated scalar displacement (`value`), packed 32-bit `rgba`, `flags`, and 8-byte material/biome payload (`attr[0..7]`) at any world coordinate.
+1. **Single-Arena Zero-Allocation Traversal & O(1) LRU Pool**:
+   - Allocates the entire quadtree node pool, bounded `ar_sample_t` sub-pool, vertex buffers, and spatial hash table in a single contiguous arena at startup (`createAreoleSystem`), performing zero heap allocations during per-frame camera motion with per-frame `ar_metrics_t` telemetry.
+2. **Exact SAT 6-Plane Frustum, 3D Manifold Horizon & 2D Software Hi-Z Occlusion Culling**:
+   - Extracts exact frustum planes from the active camera view (supporting full $360^\circ$ yaw, $0^\circ\text{–}85^\circ$ pitch, cached Z bounds tightening, planetary horizon curvature sag, pluggable 3D manifold AABB / normal-cone horizon callbacks `ar_bounds_3d_fn` / `ar_cull_3d_fn`, and a 96×54 conservative 2D software Hi-Z occluder `ar_occluder_t`).
+3. **Coarse-First Max-Heap LOD Selection, 4-Wide Row Batching & Async Workqueue Population ($O(1)$ Active Budget)**:
+   - Guarantees complete 4-quadrant horizon coverage within a bounded `maxActive` chunk budget with breadth-first budget coarsening, vectorized scanline (`ar_row_sampler_fn`) and 4-wide batched (`ar_eval_row4_fn`) row callbacks, watertight cross-LOD seam welding, and background worker population (`<ttypt/wq.h>`).
+4. **Hierarchical Point, Attribute & Height-Only Probing (`.probe(wx, wy)` / `ar_probe_val`)**:
+   - Evaluates continuous interpolated scalar displacement (`value`), packed 32-bit `rgba`, `flags`, and 8-byte material/biome payload (`attr[0..7]`) at any world coordinate, plus fast height-only scalar probes (`ar_probe_val` / `ar_probe_view_val`) in C/WASM.
 
 ---
 

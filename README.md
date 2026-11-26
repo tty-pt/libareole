@@ -73,18 +73,18 @@ cc app.c $(pkg-config --cflags --libs areole) -lm -o app
 1. **Domain-Agnostic Spatial Primitives (`ar_` API)**:
    - Zero game-specific concepts (elevation, biomes, water, structures) in the core engine.
    - Generic sample points provide a 16-bit scalar displacement (`val`), packed 32-bit color/attributes (`rgba`), 32-bit bitmask (`flags`), and an 8-byte application payload (`attr[8]`).
-2. **Runtime-Configurable Single-Arena Allocation (`ar_config_t`)**:
-   - Configurable grid resolution (`grid_dim`), pool capacity (`pool_capacity`), active query budget (`max_active`), hierarchy depth (`max_levels`), value scale (`value_scale`), and toroidal periods (`period_x`, `period_y`).
-   - Entire `ar_system_t` instance, node pool, contiguous vertex buffers, and spatial hash table are allocated in a single contiguous memory arena at initialization with zero runtime heap allocations during camera motion.
-3. **Rigorous Gribb-Hartmann 6-Plane Frustum Culling**:
-   - Extracts exact normalized frustum bounding planes directly from any column-major $4 \times 4$ ModelView-Projection (MVP) matrix ($row_3 \pm row_0, row_3 \pm row_1, row_3 \pm row_2$).
-   - Seamlessly supports orthographic, perspective, oblique, and rotated cameras across full $360^\circ$ yaw and $0^\circ$ to $85^\circ$ pitch angles.
+2. **Runtime-Configurable Single-Arena Allocation & Bounded `ar_sample_t` Sub-Pool (`ar_config_t`)**:
+   - Configurable grid resolution (`grid_dim`), pool capacity (`pool_capacity`), bounded full-sample sub-pool (`samples_pool_capacity`, `samples_max_level`), active query budget (`max_active`), hierarchy depth (`max_levels`), value scale (`value_scale`), and toroidal periods (`period_x`, `period_y`).
+   - Entire `ar_system_t` instance, O(1) LRU node pool, contiguous vertex buffers, and spatial hash table are allocated in a single contiguous memory arena at initialization (`ar_stats_t.arena_bytes`) with zero runtime heap allocations during camera motion.
+3. **Exact SAT 6-Plane Frustum Culling, Cached Z Tightening & 2D Software Hi-Z Occluder**:
+   - Extracts exact normalized Gribb-Hartmann frustum planes directly from any column-major $4 \times 4$ ModelView-Projection (MVP) matrix ($row_3 \pm row_0, row_3 \pm row_1, row_3 \pm row_2$) with exact SAT box testing and optional cached vertical bounds tightening (`use_cached_bounds`).
+   - Optional 96×54 (8×8 tiled) conservative 2D software Hi-Z linear-W occluder (`ar_occluder_t`, `ar_point_3d_fn`, precomputed 4×4 `occ_cell_min`) culls terrain chunks hidden behind foreground ridges front-to-back.
 4. **Pluggable Vertical, 3D Manifold Envelope & Horizon Culling Callbacks (`ar_bounds_fn`, `ar_bounds_3d_fn`, `ar_cull_3d_fn`)**:
    - Supports arbitrary 2.5D vertical envelopes (`bounds_fn`), full 3D non-Euclidean manifold bounding boxes (`bounds_3d_fn`), and manifold normal-cone/horizon visibility culling (`cull_3d_fn`) for curved or planetary surfaces.
-5. **Coarse-First Priority Refinement, Scanline Batching & Async Workqueue Population ($O(1)$ Active Chunks)**:
-   - Traversal maintains $\le \text{max\_active}$ chunks across all zoom levels with guaranteed 4-quadrant frustum coverage, optional vectorized scanline sampling (`ar_row_sampler_fn`), per-frame populate caps (`max_populates_per_frame`), and non-blocking background worker population via `<ttypt/wq.h>` (`cfg.wq`, `AR_NODE_FLAG_DEFERRED`).
-6. **Configurable Point & Attribute Probe**:
-   - Interpolates scalar `val`, blends `rgba` color channels, and interpolates application `attr[0..7]` using configurable curves (`AR_INTERP_SMOOTHSTEP`, `AR_INTERP_LINEAR`, `AR_INTERP_QUINTIC`, `AR_INTERP_NEAREST`, or custom `ar_interp_fn`) with $O(1)$ hierarchical ancestor lookup.
+5. **Coarse-First Binary Max-Heap Refinement, 4-Wide Row Batching & Async Workqueue Population ($O(1)$ Active Chunks)**:
+   - Decoupled into 6 focused compilation units (`src/ar_math.c`, `ar_occ.c`, `ar_pool.c`, `ar_populate.c`, `ar_probe.c`, `ar_solver.c`) with binary max-heap priority splitting, breadth-first budget coarsening, vectorized scanline (`ar_row_sampler_fn`) and 4-wide row-coherent (`ar_eval_row4_fn`) sampling, per-frame populate caps (`max_populates_per_frame`), and non-blocking background worker population via `<ttypt/wq.h>` (`cfg.wq`, `AR_NODE_FLAG_DEFERRED`).
+6. **Configurable Point, Attribute & Height-Only Probes (`ar_probe`, `ar_probe_val`)**:
+   - Interpolates scalar `val`, blends `rgba` color channels, and interpolates application `attr[0..7]` using configurable curves (`AR_INTERP_SMOOTHSTEP`, `AR_INTERP_LINEAR`, `AR_INTERP_QUINTIC`, `AR_INTERP_NEAREST`, or custom `ar_interp_fn`), plus zero-attribute height-only fast paths (`ar_probe_val()`, `ar_probe_view_val()`) and per-frame telemetry (`ar_metrics_t`, `ar_system_get_metrics()`).
 7. **GLSL ES 3.0 Uniform & Shader Parity (`<ttypt/areole_glsl.h>`)**:
    - Standardized uniform layouts and GLSL functions (`ar_apply_spherical_sag_ex`, `ar_glsl_ref_eval_vertex`) with bit/float parity tested C reference implementations.
 
@@ -120,6 +120,7 @@ typedef struct {
     int32_t           period_x, period_y; /* Optional toroidal world periods */
     ar_sampler_fn     sampler;          /* Required vertex sampler callback */
     ar_row_sampler_fn row_sampler;      /* Optional vectorized scanline/row sampler */
+    ar_eval_row4_fn   eval_row4;        /* Optional 4-wide row-coherent batch sampler for mixed reuse rows */
     ar_sparsity_fn    sparsity;         /* Optional discrete sparsity callback */
     void             *user_ctx;         /* Opaque context pointer passed to callbacks */
     uint32_t          max_populates_per_frame; /* Optional per-frame new-chunk populate budget */
@@ -128,6 +129,8 @@ typedef struct {
     ar_cull_3d_fn     cull_3d_fn;       /* Optional 3D manifold normal-cone/horizon culling callback */
     void             *bounds_ctx;       /* Opaque context passed to bounds/cull callbacks */
     struct stl_wq    *wq;               /* Optional stele workqueue for async background chunk population */
+    uint16_t          samples_pool_capacity; /* Optional cap on nodes retaining full ar_sample_t[] */
+    uint8_t           samples_max_level;     /* Max LOD level eligible for full ar_sample_t[] */
 } ar_config_t;
 ```
 
