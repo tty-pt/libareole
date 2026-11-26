@@ -85,9 +85,24 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			sys->metrics.frame_hits++;
 #ifdef TTYPT_WQ_H
 			if ((node->flags & AR_NODE_FLAG_DEFERRED) &&
-			    sys->wq && sys->staging_arena &&
-			    stl_wq_busy(&sys->pool_meta[hit_slot].async_task)) {
-				return node;
+			    sys->wq && sys->staging_arena) {
+				ar_node_meta_t *hmeta = &sys->pool_meta[hit_slot];
+				uint8_t st = atomic_load_explicit(&hmeta->async_task.state, memory_order_acquire);
+				if (st == STL_WQ_QUEUED || st == STL_WQ_RUNNING || st == STL_WQ_DONE)
+					return node;
+				if (sys->max_populates_per_frame > 0 && sys->frame_populates_count >= sys->max_populates_per_frame) {
+					hmeta->async_sys = sys;
+					hmeta->async_slot = hit_slot;
+					hmeta->async_key = key;
+					hmeta->async_world = world;
+					hmeta->async_level = level;
+					hmeta->async_ox = node->ox;
+					hmeta->async_oy = node->oy;
+					hmeta->async_w = node->w;
+					hmeta->async_h = node->h;
+					(void)ar_wq_submit(sys->wq, &hmeta->async_task, ar_async_populate_worker, hmeta);
+					return node;
+				}
 			}
 #endif
 			if ((node->flags & AR_NODE_FLAG_DEFERRED) &&
@@ -116,7 +131,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	ar_node_meta_t *meta = &sys->pool_meta[slot];
 #ifdef TTYPT_WQ_H
 	if (sys->wq && stl_wq_busy(&meta->async_task)) {
-		stl_wq_wait(sys->wq, &meta->async_task);
+		ar_wq_wait(sys->wq, &meta->async_task);
 	}
 	meta->async_task.state = STL_WQ_IDLE;
 #endif
@@ -131,6 +146,8 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	node->max_val = -32768;
 	meta->last_used_tick = sys->current_tick;
 	meta->last_touch_frame = sys->current_tick;
+	if (!upgrading)
+		meta->last_active_tick = 0;
 	meta->active_view_mask = 0;
 	meta->prev_active_view_mask = 0;
 	meta->state = 1;
@@ -197,7 +214,12 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	/* Deferred bilinear upsampling fallback if per-frame populate budget exceeded */
 	bool budget_exceeded = (sys->max_populates_per_frame > 0 &&
 	                        sys->frame_populates_count >= sys->max_populates_per_frame);
-	if (budget_exceeded && parent_node && (!mut_samples || parent_node->samples != NULL)) {
+#ifdef TTYPT_WQ_H
+	bool has_async_wq = (sys->wq != NULL && sys->staging_arena != NULL);
+#else
+	bool has_async_wq = false;
+#endif
+	if (budget_exceeded && parent_node && (!mut_samples || parent_node->samples != NULL || has_async_wq)) {
 		size_t idx = 0;
 		int vdim_p = (int32_t)parent_node->vert_dim;
 		const ar_sample_t *ps = parent_node->samples;
@@ -216,7 +238,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 
 				int16_t v_out;
 				uint32_t rgba_out;
-				if (mut_samples) {
+				if (mut_samples && ps) {
 					ar_sample_t *s = &mut_samples[idx];
 					if (r_even && c_even) {
 						*s = ps[pr0 * vdim_p + pc0];
@@ -276,6 +298,13 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 						            ((pc_arr[pr1 * vdim_p + pc1] & 0xFCFCFCFCu) >> 2));
 					}
 					node->flags |= (parent_node->flags & AR_NODE_USER_FLAGS_MASK);
+					if (mut_samples) {
+						ar_sample_t *s = &mut_samples[idx];
+						memset(s, 0, sizeof(*s));
+						s->val = v_out;
+						s->rgba = rgba_out;
+						s->flags = (uint8_t)(parent_node->flags & AR_NODE_USER_FLAGS_MASK);
+					}
 				}
 				if (v_out < node->min_val) node->min_val = v_out;
 				if (v_out > node->max_val) node->max_val = v_out;
@@ -289,7 +318,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		node->occ_grid_k = 0;
 		node->rev++;
 #ifdef TTYPT_WQ_H
-		if (sys->wq && sys->staging_arena && !stl_wq_busy(&meta->async_task)) {
+		if (has_async_wq && !stl_wq_busy(&meta->async_task)) {
 			meta->async_sys = sys;
 			meta->async_slot = (uint32_t)slot;
 			meta->async_key = key;
@@ -299,13 +328,104 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 			meta->async_oy = oy;
 			meta->async_w = node->w;
 			meta->async_h = node->h;
-			(void)stl_wq_submit(sys->wq, &meta->async_task, ar_async_populate_worker, meta);
+			(void)ar_wq_submit(sys->wq, &meta->async_task, ar_async_populate_worker, meta);
 		}
 #endif
 		if (sys->timing_enabled)
 			sys->metrics.us_populate += (uint32_t)(ar_now_us(true) - t_pop);
 		return node;
 	}
+
+#ifdef TTYPT_WQ_H
+	/* Fast 5x5 coarse preview + async full bake when budget exceeded and no cached parent exists */
+	if (budget_exceeded && has_async_wq && gdim >= 4) {
+		ar_sample_t cgrid[25];
+		for (int cr = 0; cr <= 4; cr++) {
+			int32_t wy = oy + (int32_t)(((int64_t)cr * node->h) >> 2);
+			if (sys->row_sampler) {
+				sys->row_sampler(sys->user_ctx, world, level, wy, ox, node->w, 5u, &cgrid[cr * 5]);
+			} else {
+				for (int cc = 0; cc <= 4; cc++) {
+					int32_t wx = ox + (int32_t)(((int64_t)cc * node->w) >> 2);
+					sys->sampler(sys->user_ctx, world, level, wx, wy, &cgrid[cr * 5 + cc]);
+				}
+			}
+		}
+		for (int ci = 0; ci < 25; ci++) {
+			if (!cgrid[ci].rgba)
+				cgrid[ci].rgba = sys->default_rgba;
+			node->flags |= (cgrid[ci].flags & AR_NODE_USER_FLAGS_MASK);
+		}
+		size_t idx = 0;
+		for (int r = 0; r <= gdim; r++) {
+			int32_t ry_q8 = (r * 4 * 256) / gdim;
+			int cr0 = ry_q8 >> 8;
+			int cr1 = (cr0 < 4) ? (cr0 + 1) : 4;
+			int fy = ry_q8 & 255;
+			int ify = 256 - fy;
+			for (int c = 0; c <= gdim; c++) {
+				int32_t cx_q8 = (c * 4 * 256) / gdim;
+				int cc0 = cx_q8 >> 8;
+				int cc1 = (cc0 < 4) ? (cc0 + 1) : 4;
+				int fx = cx_q8 & 255;
+				int ifx = 256 - fx;
+
+				const ar_sample_t *s00 = &cgrid[cr0 * 5 + cc0];
+				const ar_sample_t *s10 = &cgrid[cr0 * 5 + cc1];
+				const ar_sample_t *s01 = &cgrid[cr1 * 5 + cc0];
+				const ar_sample_t *s11 = &cgrid[cr1 * 5 + cc1];
+
+				int32_t v0 = ((int32_t)s00->val * ifx + (int32_t)s10->val * fx) >> 8;
+				int32_t v1 = ((int32_t)s01->val * ifx + (int32_t)s11->val * fx) >> 8;
+				int16_t v_out = (int16_t)((v0 * ify + v1 * fy) >> 8);
+
+				uint32_t c00 = s00->rgba, c10 = s10->rgba, c01 = s01->rgba, c11 = s11->rgba;
+				uint32_t r0 = ((c00 & 0xFFu) * (uint32_t)ifx + (c10 & 0xFFu) * (uint32_t)fx) >> 8;
+				uint32_t r1 = ((c01 & 0xFFu) * (uint32_t)ifx + (c11 & 0xFFu) * (uint32_t)fx) >> 8;
+				uint32_t g0 = (((c00 >> 8) & 0xFFu) * (uint32_t)ifx + ((c10 >> 8) & 0xFFu) * (uint32_t)fx) >> 8;
+				uint32_t g1 = (((c01 >> 8) & 0xFFu) * (uint32_t)ifx + ((c11 >> 8) & 0xFFu) * (uint32_t)fx) >> 8;
+				uint32_t b0 = (((c00 >> 16) & 0xFFu) * (uint32_t)ifx + ((c10 >> 16) & 0xFFu) * (uint32_t)fx) >> 8;
+				uint32_t b1 = (((c01 >> 16) & 0xFFu) * (uint32_t)ifx + ((c11 >> 16) & 0xFFu) * (uint32_t)fx) >> 8;
+				const ar_sample_t *nearest = (fy < 128) ? ((fx < 128) ? s00 : s10)
+				                                        : ((fx < 128) ? s01 : s11);
+				uint32_t rgba_out = (((r0 * (uint32_t)ify + r1 * (uint32_t)fy) >> 8) & 0xFFu) |
+				                    ((((g0 * (uint32_t)ify + g1 * (uint32_t)fy) >> 8) & 0xFFu) << 8) |
+				                    ((((b0 * (uint32_t)ify + b1 * (uint32_t)fy) >> 8) & 0xFFu) << 16) |
+				                    (nearest->rgba & 0xFF000000u);
+
+				if (v_out < node->min_val) node->min_val = v_out;
+				if (v_out > node->max_val) node->max_val = v_out;
+				mut_values[idx] = v_out;
+				mut_rgba[idx] = rgba_out;
+				if (mut_samples) {
+					ar_sample_t *ds = &mut_samples[idx];
+					*ds = *nearest;
+					ds->val = v_out;
+					ds->rgba = rgba_out;
+				}
+				idx++;
+			}
+		}
+		node->flags |= AR_NODE_FLAG_DEFERRED;
+		node->occ_grid_k = 0;
+		node->rev++;
+		if (!stl_wq_busy(&meta->async_task)) {
+			meta->async_sys = sys;
+			meta->async_slot = (uint32_t)slot;
+			meta->async_key = key;
+			meta->async_world = world;
+			meta->async_level = level;
+			meta->async_ox = ox;
+			meta->async_oy = oy;
+			meta->async_w = node->w;
+			meta->async_h = node->h;
+			(void)ar_wq_submit(sys->wq, &meta->async_task, ar_async_populate_worker, meta);
+		}
+		if (sys->timing_enabled)
+			sys->metrics.us_populate += (uint32_t)(ar_now_us(true) - t_pop);
+		return node;
+	}
+#endif
 
 	sys->frame_populates_count++;
 	sys->metrics.frame_populates++;

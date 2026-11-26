@@ -191,7 +191,11 @@ static inline float ar_cand_split_ratio(ar_system_t *sys, uint16_t world,
 				    cslot < sys->pool_capacity && sys->pool_meta[cslot].state == 1) {
 					uint32_t mask = use_prev ? sys->pool_meta[cslot].prev_active_view_mask
 					                         : sys->pool_meta[cslot].active_view_mask;
-					if ((mask & view_mask) != 0u) {
+					uint32_t lat = sys->pool_meta[cslot].last_active_tick;
+					bool recent_primary = (view_mask == 1u && lat > 0u &&
+					                       sys->current_tick >= lat &&
+					                       (sys->current_tick - lat) <= AR_HYSTERESIS_GRACE_TICKS);
+					if ((mask & view_mask) != 0u || recent_primary) {
 						kids_were_active = true;
 						break;
 					}
@@ -827,116 +831,121 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 
 		while (uncached_total > max_pops) {
 			bool merged = false;
-			/* Coarsen breadth-first by lowest level (farthest first within each level)
-			 * so the quadtree degrades uniformly by 1 level instead of collapsing one quadrant repeatedly. */
-			uint8_t min_u_lvl = root_level;
+			/* Protect the closest uncached leaves so coarsening never swallows the focal foreground
+			 * and every frame makes guaranteed forward progress toward full resolution. */
+			size_t closest_u_limit = (max_pops > 2u) ? (size_t)(max_pops >> 1) : 1u;
+			uint32_t u_seen = 0;
+			size_t protect_end = 0;
 			for (size_t i = 0; i < active_count; i++) {
-				if (!active_cands[i].cached && active_cands[i].level < min_u_lvl)
-					min_u_lvl = active_cands[i].level;
-			}
-			for (uint8_t try_lvl = min_u_lvl; try_lvl < root_level && !merged; try_lvl++) {
-			for (size_t rev = active_count; rev > 0 && !merged; rev--) {
-				size_t idx = rev - 1;
-				if (active_cands[idx].cached || active_cands[idx].level != try_lvl)
-					continue;
-
-				uint8_t best_plvl = 0;
-				int32_t best_pox = 0, best_poy = 0;
-				bool best_pcached = false;
-				uint32_t best_g_uncached = 0;
-				int best_tier = 99;
-
-				for (uint8_t p_lvl = (uint8_t)(active_cands[idx].level + 1); p_lvl <= root_level; p_lvl++) {
-					int32_t pw = sys->base_w << p_lvl;
-					int32_t ph = sys->base_h << p_lvl;
-					int32_t pox = morton_fdiv(active_cands[idx].ox, pw) * pw;
-					int32_t poy = morton_fdiv(active_cands[idx].oy, ph) * ph;
-					int64_t px1 = (int64_t)pox + (int64_t)pw;
-					int64_t py1 = (int64_t)poy + (int64_t)ph;
-
-					uint64_t pkey = morton_quad_key(world, p_lvl, pox, poy,
-					                                sys->base_w, sys->base_h);
-					uint32_t pslot = 0;
-					bool p_cached = (ar_map_get(sys, pkey, &pslot) &&
-					                 pslot < sys->pool_capacity && sys->pool_meta[pslot].state == 1);
-
-					uint32_t g_uncached = 0;
-					for (size_t j = 0; j < active_count; j++) {
-						if (active_cands[j].ox >= pox && (int64_t)active_cands[j].ox < px1 &&
-						    active_cands[j].oy >= poy && (int64_t)active_cands[j].oy < py1) {
-							if (!active_cands[j].cached) g_uncached++;
-						}
-					}
-
-					/* Never let a distant cached ancestor (e.g. orbital node) swallow dozens of finer leaves */
-					bool valid = false;
-					if (p_cached && g_uncached >= 1 && p_lvl <= active_cands[idx].level + 2 &&
-					    uncached_total > g_uncached) {
-						valid = true;
-					} else if (!p_cached && g_uncached >= 2) {
-						valid = true;
-					} else if (p_cached && g_uncached >= 1 && p_lvl == active_cands[idx].level + 1) {
-						valid = true;
-					}
-
-					if (valid) {
-						best_tier = 0;
-						best_plvl = p_lvl;
-						best_pox = pox;
-						best_poy = poy;
-						best_pcached = p_cached;
-						best_g_uncached = g_uncached;
+				if (!active_cands[i].cached) {
+					u_seen++;
+					protect_end = i + 1;
+					if (u_seen >= closest_u_limit)
 						break;
-					}
-				}
-
-				if (best_tier < 99) {
-					int32_t pw = sys->base_w << best_plvl;
-					int32_t ph = sys->base_h << best_plvl;
-					int64_t px1 = (int64_t)best_pox + (int64_t)pw;
-					int64_t py1 = (int64_t)best_poy + (int64_t)ph;
-
-					size_t write_i = 0;
-					for (size_t j = 0; j < active_count; j++) {
-						if (active_cands[j].ox >= best_pox && (int64_t)active_cands[j].ox < px1 &&
-						    active_cands[j].oy >= best_poy && (int64_t)active_cands[j].oy < py1) {
-							continue;
-						}
-						active_cands[write_i++] = active_cands[j];
-					}
-
-					ar_candidate_t pcand;
-					memset(&pcand, 0, sizeof(pcand));
-					float center_xyz[3], span_w, span_h, nz_min, nz_max;
-					ar_compute_node_3d_box(sys, opts, world, best_plvl,
-					                       best_pox, best_poy, pw, ph,
-					                       eye_xyz, has_eye,
-					                       pcand.b_min, pcand.b_max, center_xyz,
-					                       &span_w, &span_h, &pcand.dist_sq,
-					                       &nz_min, &nz_max);
-					pcand.ox = best_pox;
-					pcand.oy = best_poy;
-					pcand.level = best_plvl;
-					pcand.active = true;
-					pcand.cached = best_pcached;
-
-					/* Insert pcand maintaining front-to-back sort by dist_sq */
-					size_t ins = write_i;
-					while (ins > 0 && (active_cands[ins - 1].dist_sq > pcand.dist_sq ||
-					                   (active_cands[ins - 1].dist_sq == pcand.dist_sq &&
-					                    active_cands[ins - 1].level < pcand.level))) {
-						active_cands[ins] = active_cands[ins - 1];
-						ins--;
-					}
-					active_cands[ins] = pcand;
-					active_count = write_i + 1;
-
-					uint32_t reduction = best_pcached ? best_g_uncached : (best_g_uncached - 1u);
-					uncached_total = (uncached_total > reduction) ? (uncached_total - reduction) : 0u;
-					sys->metrics.frame_split_blocks_budget++;
-					merged = true;
 				}
 			}
+
+			for (int pass = 0; pass < 2 && !merged; pass++) {
+				size_t min_idx = (pass == 0) ? protect_end : 0;
+				/* Exhaust 1-level parent merges across all eligible leaves before climbing higher,
+				 * preventing a lone uncached leaf from collapsing the entire view into a macro ancestor. */
+				for (uint8_t p_delta = 1; p_delta <= root_level && !merged; p_delta++) {
+					uint8_t min_u_lvl = root_level;
+					for (size_t i = min_idx; i < active_count; i++) {
+						if (!active_cands[i].cached && active_cands[i].level < min_u_lvl)
+							min_u_lvl = active_cands[i].level;
+					}
+					for (uint8_t try_lvl = min_u_lvl; try_lvl < root_level && !merged; try_lvl++) {
+						uint8_t p_lvl = (uint8_t)(try_lvl + p_delta);
+						if (p_lvl > root_level)
+							continue;
+						for (size_t rev = active_count; rev > min_idx && !merged; rev--) {
+							size_t idx = rev - 1;
+							if (active_cands[idx].cached || active_cands[idx].level != try_lvl)
+								continue;
+
+							int32_t pw = sys->base_w << p_lvl;
+							int32_t ph = sys->base_h << p_lvl;
+							int32_t pox = morton_fdiv(active_cands[idx].ox, pw) * pw;
+							int32_t poy = morton_fdiv(active_cands[idx].oy, ph) * ph;
+							int64_t px1 = (int64_t)pox + (int64_t)pw;
+							int64_t py1 = (int64_t)poy + (int64_t)ph;
+
+							uint64_t pkey = morton_quad_key(world, p_lvl, pox, poy,
+							                                sys->base_w, sys->base_h);
+							uint32_t pslot = 0;
+							bool p_cached = (ar_map_get(sys, pkey, &pslot) &&
+							                 pslot < sys->pool_capacity && sys->pool_meta[pslot].state == 1);
+
+							uint32_t g_uncached = 0;
+							bool hits_protected = false;
+							for (size_t j = 0; j < active_count; j++) {
+								if (active_cands[j].ox >= pox && (int64_t)active_cands[j].ox < px1 &&
+								    active_cands[j].oy >= poy && (int64_t)active_cands[j].oy < py1) {
+									if (!active_cands[j].cached) {
+										g_uncached++;
+										if (pass == 0 && j < protect_end)
+											hits_protected = true;
+									}
+								}
+							}
+							if (hits_protected)
+								continue;
+
+							/* Never let a distant ancestor swallow all uncached leaves when foreground work remains */
+							bool valid = false;
+							if (p_cached && g_uncached >= 1 && p_delta <= 2 &&
+							    (uncached_total > g_uncached || p_delta == 1)) {
+								valid = true;
+							} else if (!p_cached && g_uncached >= 2 &&
+							           (pass == 1 || uncached_total > g_uncached)) {
+								valid = true;
+							}
+							if (!valid)
+								continue;
+
+							size_t write_i = 0;
+							for (size_t j = 0; j < active_count; j++) {
+								if (active_cands[j].ox >= pox && (int64_t)active_cands[j].ox < px1 &&
+								    active_cands[j].oy >= poy && (int64_t)active_cands[j].oy < py1) {
+									continue;
+								}
+								active_cands[write_i++] = active_cands[j];
+							}
+
+							ar_candidate_t pcand;
+							memset(&pcand, 0, sizeof(pcand));
+							float center_xyz[3], span_w, span_h, nz_min, nz_max;
+							ar_compute_node_3d_box(sys, opts, world, p_lvl,
+							                       pox, poy, pw, ph,
+							                       eye_xyz, has_eye,
+							                       pcand.b_min, pcand.b_max, center_xyz,
+							                       &span_w, &span_h, &pcand.dist_sq,
+							                       &nz_min, &nz_max);
+							pcand.ox = pox;
+							pcand.oy = poy;
+							pcand.level = p_lvl;
+							pcand.active = true;
+							pcand.cached = p_cached;
+
+							/* Insert pcand maintaining front-to-back sort by dist_sq */
+							size_t ins = write_i;
+							while (ins > 0 && (active_cands[ins - 1].dist_sq > pcand.dist_sq ||
+							                   (active_cands[ins - 1].dist_sq == pcand.dist_sq &&
+							                    active_cands[ins - 1].level < pcand.level))) {
+								active_cands[ins] = active_cands[ins - 1];
+								ins--;
+							}
+							active_cands[ins] = pcand;
+							active_count = write_i + 1;
+
+							uint32_t reduction = p_cached ? g_uncached : (g_uncached - 1u);
+							uncached_total = (uncached_total > reduction) ? (uncached_total - reduction) : 0u;
+							sys->metrics.frame_split_blocks_budget++;
+							merged = true;
+						}
+					}
+				}
 			}
 			if (!merged)
 				break;
@@ -970,6 +979,8 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			size_t slot_idx = (size_t)(node - sys->pool);
 			sys->pool_meta[slot_idx].active_view_mask |= view_mask;
 			sys->pool_meta[slot_idx].last_touch_frame = sys->current_tick;
+			if (view_mask == 1u)
+				sys->pool_meta[slot_idx].last_active_tick = sys->current_tick;
 			out_nodes[out_count] = node;
 			sys->active_chunks[out_count] = node;
 			out_count++;
@@ -1299,6 +1310,8 @@ size_t ar_system_eval_ortho_ex(ar_system_t *sys, uint8_t view_id, uint16_t world
 				size_t slot_idx = (size_t)(node - sys->pool);
 				sys->pool_meta[slot_idx].active_view_mask |= view_mask;
 				sys->pool_meta[slot_idx].last_touch_frame = sys->current_tick;
+				if (view_mask == 1u)
+					sys->pool_meta[slot_idx].last_active_tick = sys->current_tick;
 				if (count < sys->max_active)
 					sys->active_chunks[count] = node;
 				count++;

@@ -2287,6 +2287,66 @@ int main(void)
 		       s_eval_row4_calls);
 	}
 
+	/* Test 36: 180-tick grace-period hysteresis memory across 360-deg camera rotation */
+	{
+		ar_system_t *hcs = ar_create(160, 128, TEST_GRID_DIM, 256, TEST_MAX_ACTIVE, TEST_MAX_LEVELS,
+		                             mock_sampler, NULL);
+		assert(hcs != NULL);
+
+		/* Build 2 camera poses: forward (+Y) and opposite (-Y, 180-deg away) */
+		float up[3] = { 0.0f, 0.0f, 1.0f };
+		float mv_fwd[16], mv_back[16], proj[16], mvp_fwd[16], mvp_back[16];
+		float eye_fwd[3]  = { 0.0f, -900.0f, 900.0f };
+		float tgt_fwd[3]  = { 0.0f,  400.0f,   0.0f };
+		float eye_back[3] = { 0.0f,  900.0f, 900.0f };
+		float tgt_back[3] = { 0.0f, -400.0f,   0.0f };
+		ar_mat4_perspective(proj, 0.785398f, 16.0f / 9.0f, 2.0f, 200000.0f);
+		ar_mat4_lookat(mv_fwd, eye_fwd, tgt_fwd, up);
+		ar_mat4_multiply(mvp_fwd, proj, mv_fwd);
+		ar_mat4_lookat(mv_back, eye_back, tgt_back, up);
+		ar_mat4_multiply(mvp_back, proj, mv_back);
+
+		ar_cull_opts_t h_opts = {
+			.z_min = -500.0f, .z_max = 500.0f,
+			.focal_x = 0.0f, .focal_y = 0.0f,
+			.margin = 100.0f, .target_quad_px = 2.0f,
+			.viewport_w = 1280.0f, .viewport_h = 720.0f,
+			.min_level = 0, .max_level = 10,
+			.view_id = 0,
+			.split_hysteresis = 0.25f
+		};
+
+		/* Frame 1: Look forward at slightly closer range so nodes split cleanly */
+		const ar_node_t *out[TEST_MAX_ACTIVE];
+		ar_system_begin_frame(hcs);
+		size_t n_init = ar_system_query_matrix(hcs, 1, mvp_fwd, &h_opts, out, TEST_MAX_ACTIVE);
+		assert(n_init > 0);
+		ar_stats_t st_init;
+		ar_system_get_stats(hcs, &st_init);
+
+		/* Rotate 180 deg away for 60 frames (within 180-tick grace period) */
+		for (int f = 0; f < 60; f++) {
+			ar_system_begin_frame(hcs);
+			size_t nb = ar_system_query_matrix(hcs, 1, mvp_back, &h_opts, out, TEST_MAX_ACTIVE);
+			assert(nb > 0);
+		}
+		ar_stats_t st_after_away;
+		ar_system_get_stats(hcs, &st_after_away);
+
+		/* Rotate back to forward view: cached leaves & grace hysteresis must yield 0 cache misses
+		 * and identical leaf count (no re-refinement churn) */
+		ar_system_begin_frame(hcs);
+		size_t n_return = ar_system_query_matrix(hcs, 1, mvp_fwd, &h_opts, out, TEST_MAX_ACTIVE);
+		ar_stats_t st_return;
+		ar_system_get_stats(hcs, &st_return);
+		assert(n_return == n_init);
+		assert(st_return.cache_misses_total == st_after_away.cache_misses_total);
+
+		ar_destroy(hcs);
+		printf("  [PASS] 180-tick rotation grace-period hysteresis verified (n=%zu, return_misses=0)\n",
+		       n_return);
+	}
+
 	ar_system_destroy(cs);
 	printf("=== All Standalone libareole Spatial Hierarchy Tests PASSED ===\n");
 	return 0;

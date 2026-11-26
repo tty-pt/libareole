@@ -288,42 +288,64 @@ ar_system_t *ar_system_create(int32_t base_w, int32_t base_h,
 
 #ifdef TTYPT_WQ_H
 #if defined(__GNUC__) && !defined(__wasm__)
-__attribute__((weak)) uint32_t stl_cpu_count(void) { return 1u; }
-__attribute__((weak)) stl_wq_t *stl_wq_create(const char *name, uint32_t nthreads, uint32_t capacity)
+extern int          stl_wq_submit(stl_wq_t *wq, stl_wq_task_t *task, stl_wq_fn fn, void *arg) __attribute__((weak));
+extern unsigned int stl_wq_thread_count(const stl_wq_t *wq) __attribute__((weak));
+extern unsigned int stl_wq_step(stl_wq_t *wq, unsigned int max_tasks) __attribute__((weak));
+extern void         stl_wq_wait(stl_wq_t *wq, stl_wq_task_t *task) __attribute__((weak));
+extern void         stl_wq_drain(stl_wq_t *wq) __attribute__((weak));
+#endif
+static inline int ar_wq_submit(stl_wq_t *wq, stl_wq_task_t *task, stl_wq_fn fn, void *arg)
 {
-	(void)name; (void)nthreads; (void)capacity;
-	return NULL;
-}
-__attribute__((weak)) int stl_wq_submit(stl_wq_t *wq, stl_wq_task_t *task, stl_wq_fn fn, void *arg)
-{
-	(void)wq;
+#if defined(__GNUC__) && !defined(__wasm__)
+	if (stl_wq_submit)
+		return stl_wq_submit(wq, task, fn, arg);
 	if (!task || !fn) return -1;
 	task->fn = fn;
 	task->arg = arg;
-	task->state = STL_WQ_RUNNING;
+	atomic_store_explicit(&task->state, (uint8_t)STL_WQ_RUNNING, memory_order_relaxed);
 	fn(arg);
-	task->state = STL_WQ_DONE;
+	atomic_store_explicit(&task->state, (uint8_t)STL_WQ_DONE, memory_order_release);
 	return 0;
-}
-__attribute__((weak)) uint32_t stl_wq_step(stl_wq_t *wq, uint32_t max_tasks)
-{
-	(void)wq; (void)max_tasks;
-	return 0u;
-}
-__attribute__((weak)) void stl_wq_wait(stl_wq_t *wq, stl_wq_task_t *task)
-{
-	(void)wq;
-	if (task) task->state = STL_WQ_DONE;
-}
-__attribute__((weak)) void stl_wq_drain(stl_wq_t *wq)
-{
-	(void)wq;
-}
-__attribute__((weak)) void stl_wq_destroy(stl_wq_t *wq)
-{
-	(void)wq;
-}
+#else
+	return stl_wq_submit(wq, task, fn, arg);
 #endif
+}
+static inline unsigned int ar_wq_thread_count(const stl_wq_t *wq)
+{
+#if defined(__GNUC__) && !defined(__wasm__)
+	return stl_wq_thread_count ? stl_wq_thread_count(wq) : 0u;
+#else
+	return stl_wq_thread_count(wq);
+#endif
+}
+static inline unsigned int ar_wq_step(stl_wq_t *wq, unsigned int max_tasks)
+{
+#if defined(__GNUC__) && !defined(__wasm__)
+	return stl_wq_step ? stl_wq_step(wq, max_tasks) : 0u;
+#else
+	return stl_wq_step(wq, max_tasks);
+#endif
+}
+static inline void ar_wq_wait(stl_wq_t *wq, stl_wq_task_t *task)
+{
+#if defined(__GNUC__) && !defined(__wasm__)
+	if (stl_wq_wait)
+		stl_wq_wait(wq, task);
+	else if (task)
+		atomic_store_explicit(&task->state, (uint8_t)STL_WQ_DONE, memory_order_release);
+#else
+	stl_wq_wait(wq, task);
+#endif
+}
+static inline void ar_wq_drain(stl_wq_t *wq)
+{
+#if defined(__GNUC__) && !defined(__wasm__)
+	if (stl_wq_drain)
+		stl_wq_drain(wq);
+#else
+	stl_wq_drain(wq);
+#endif
+}
 #endif
 
 void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq)
@@ -332,7 +354,7 @@ void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq)
 		return;
 #ifdef TTYPT_WQ_H
 	if (sys->wq && sys->wq != wq) {
-		stl_wq_drain(sys->wq);
+		ar_wq_drain(sys->wq);
 	}
 	sys->wq = wq;
 	if (wq && !sys->staging_arena) {
@@ -368,7 +390,7 @@ void ar_system_destroy(ar_system_t *sys)
 	if (sys->wq) {
 		for (size_t i = 0; i < sys->pool_capacity; i++) {
 			if (stl_wq_busy(&sys->pool_meta[i].async_task))
-				stl_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
+				ar_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
 		}
 	}
 #endif
@@ -463,7 +485,7 @@ void ar_system_clear(ar_system_t *sys)
 	if (sys->wq) {
 		for (size_t i = 0; i < sys->pool_capacity; i++) {
 			if (stl_wq_busy(&sys->pool_meta[i].async_task))
-				stl_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
+				ar_wq_wait(sys->wq, &sys->pool_meta[i].async_task);
 			sys->pool_meta[i].async_task.state = STL_WQ_IDLE;
 		}
 	}
@@ -471,6 +493,7 @@ void ar_system_clear(ar_system_t *sys)
 	for (size_t i = 0; i < sys->pool_capacity; i++) {
 		sys->pool_meta[i].state = 0;
 		sys->pool_meta[i].last_used_tick = 0;
+		sys->pool_meta[i].last_active_tick = 0;
 		sys->pool_meta[i].active_view_mask = 0;
 		sys->pool_meta[i].prev_active_view_mask = 0;
 		if (sys->samples_bounded) {
@@ -502,7 +525,8 @@ void ar_system_begin_frame(ar_system_t *sys)
 
 #ifdef TTYPT_WQ_H
 	if (sys->wq && sys->staging_arena) {
-		stl_wq_step(sys->wq, 16u);
+		if (ar_wq_thread_count(sys->wq) == 0u)
+			ar_wq_step(sys->wq, 4u);
 		size_t vals_bytes = (size_t)sys->vert_count * sizeof(int16_t);
 		size_t rgba_bytes = (size_t)sys->vert_count * sizeof(uint32_t);
 		size_t samp_bytes = (size_t)sys->vert_count * sizeof(ar_sample_t);
@@ -510,7 +534,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 			ar_node_meta_t *meta = &sys->pool_meta[cur];
 			meta->prev_active_view_mask = meta->active_view_mask;
 			meta->active_view_mask = 0u;
-			if (stl_wq_done(&meta->async_task)) {
+			if (atomic_load_explicit(&meta->async_task.state, memory_order_acquire) == STL_WQ_DONE) {
 				ar_node_t *node = &sys->pool[cur];
 				if (meta->state == 1 && meta->morton_key == meta->async_key &&
 				    (node->flags & AR_NODE_FLAG_DEFERRED)) {
@@ -526,7 +550,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 					sys->stats.sampler_invocations_total += sys->vert_count;
 					sys->metrics.frame_deferred_upgrades++;
 				}
-				meta->async_task.state = STL_WQ_IDLE;
+				atomic_store_explicit(&meta->async_task.state, (uint8_t)STL_WQ_IDLE, memory_order_relaxed);
 			}
 		}
 		return;

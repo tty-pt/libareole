@@ -28,10 +28,13 @@ typedef struct {
 	bool    cached;
 } ar_candidate_t;
 
+#define AR_HYSTERESIS_GRACE_TICKS 180u
+
 typedef struct {
 	uint64_t       morton_key;
 	uint32_t       last_used_tick;
 	uint32_t       last_touch_frame;
+	uint32_t       last_active_tick;
 	uint32_t       active_view_mask;
 	uint32_t       prev_active_view_mask;
 	uint8_t        state;
