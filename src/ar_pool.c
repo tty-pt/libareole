@@ -214,6 +214,7 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	sys->margin = (cfg->margin >= 0.0f) ? cfg->margin : 0.0f;
 	sys->sampler = cfg->sampler;
 	sys->row_sampler = cfg->row_sampler;
+	sys->eval_row4 = cfg->eval_row4;
 	sys->sparsity = cfg->sparsity;
 	sys->user_ctx = cfg->user_ctx;
 	sys->max_populates_per_frame = cfg->max_populates_per_frame;

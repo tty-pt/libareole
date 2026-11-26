@@ -347,9 +347,20 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		for (int r = 0; r <= gdim; r++) {
 			int32_t wy = oy + (int32_t)(((int64_t)r * node->h) / gdim);
 
-			/* Fast path: when only parent_node is reusable (zoom-in split), odd rows
-			 * have zero parent vertices -> batch the entire row via row_sampler! */
-			if (sys->row_sampler && !can_reuse_children && ((r & 1) != 0)) {
+			/* Fast path: if neither child covering row r exists and parent cannot
+			 * supply any vertex on row r, batch the entire row via row_sampler! */
+			bool row_has_child = false;
+			if (can_reuse_children) {
+				int qy = (r > half_gdim) ? 1 : 0;
+				const ar_node_t *c0 = child_nodes[0 | (qy << 1)];
+				const ar_node_t *c1 = child_nodes[1 | (qy << 1)];
+				if ((c0 && (!mut_samples || c0->samples != NULL)) ||
+				    (c1 && (!mut_samples || c1->samples != NULL)))
+					row_has_child = true;
+			}
+			bool row_has_parent = (can_reuse_parent && ((r & 1) == 0));
+
+			if (sys->row_sampler && !row_has_child && !row_has_parent) {
 				ar_sample_t *row_dst = mut_samples ? &mut_samples[idx] : sys->row_scratch;
 				sys->row_sampler(sys->user_ctx, world, level, wy, ox, node->w, (uint32_t)vdim, row_dst);
 				sys->stats.sampler_invocations_total += (uint32_t)vdim;
@@ -368,13 +379,17 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 				continue;
 			}
 
+			int32_t miss_wx[4];
+			size_t miss_idx[4];
+			int nmiss = 0;
+
 			for (int c = 0; c <= gdim; c++) {
 				int32_t wx = ox + (int32_t)(((int64_t)c * node->w) / gdim);
 				ar_sample_t tmp_s;
 				ar_sample_t *s = mut_samples ? &mut_samples[idx] : &tmp_s;
 				bool reused = false;
 
-				if (can_reuse_children) {
+				if (row_has_child) {
 					int qx = (c > half_gdim) ? 1 : 0;
 					int qy = (r > half_gdim) ? 1 : 0;
 					uint8_t q = (uint8_t)(qx | (qy << 1));
@@ -397,7 +412,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 						}
 					}
 				}
-				if (!reused && can_reuse_parent && ((r & 1) == 0) && ((c & 1) == 0)) {
+				if (!reused && row_has_parent && ((c & 1) == 0)) {
 					int pr = parent_r_off + (r >> 1);
 					int pc = parent_c_off + (c >> 1);
 					int32_t p_wx = parent_node->ox + (int32_t)(((int64_t)pc * parent_node->w) / gdim);
@@ -415,20 +430,67 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 					}
 				}
 
-				if (!reused) {
+				if (reused) {
+					if (s->val < node->min_val) node->min_val = s->val;
+					if (s->val > node->max_val) node->max_val = s->val;
+					node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+
+					mut_values[idx] = s->val;
+					mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+					idx++;
+				} else if (sys->eval_row4) {
+					miss_wx[nmiss] = wx;
+					miss_idx[nmiss] = idx;
+					nmiss++;
+					idx++;
+					if (nmiss == 4) {
+						ar_sample_t batch[4];
+						memset(batch, 0, sizeof(batch));
+						sys->eval_row4(sys->user_ctx, world, level, miss_wx, wy, batch);
+						sys->stats.sampler_invocations_total += 4u;
+						sys->metrics.frame_row_sampler_calls++;
+						sys->metrics.frame_verts_sampled += 4u;
+						for (int k = 0; k < 4; k++) {
+							size_t mi = miss_idx[k];
+							if (mut_samples)
+								mut_samples[mi] = batch[k];
+							if (batch[k].val < node->min_val) node->min_val = batch[k].val;
+							if (batch[k].val > node->max_val) node->max_val = batch[k].val;
+							node->flags |= (batch[k].flags & AR_NODE_USER_FLAGS_MASK);
+							mut_values[mi] = batch[k].val;
+							mut_rgba[mi] = batch[k].rgba ? batch[k].rgba : sys->default_rgba;
+						}
+						nmiss = 0;
+					}
+				} else {
 					sys->sampler(sys->user_ctx, world, level, wx, wy, s);
 					sys->stats.sampler_invocations_total++;
 					sys->metrics.frame_scalar_sampler_calls++;
 					sys->metrics.frame_verts_sampled++;
-				}
 
+					if (s->val < node->min_val) node->min_val = s->val;
+					if (s->val > node->max_val) node->max_val = s->val;
+					node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
+
+					mut_values[idx] = s->val;
+					mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
+					idx++;
+				}
+			}
+
+			for (int k = 0; k < nmiss; k++) {
+				size_t mi = miss_idx[k];
+				ar_sample_t tmp_s;
+				ar_sample_t *s = mut_samples ? &mut_samples[mi] : &tmp_s;
+				sys->sampler(sys->user_ctx, world, level, miss_wx[k], wy, s);
+				sys->stats.sampler_invocations_total++;
+				sys->metrics.frame_scalar_sampler_calls++;
+				sys->metrics.frame_verts_sampled++;
 				if (s->val < node->min_val) node->min_val = s->val;
 				if (s->val > node->max_val) node->max_val = s->val;
 				node->flags |= (s->flags & AR_NODE_USER_FLAGS_MASK);
-
-				mut_values[idx] = s->val;
-				mut_rgba[idx] = s->rgba ? s->rgba : sys->default_rgba;
-				idx++;
+				mut_values[mi] = s->val;
+				mut_rgba[mi] = s->rgba ? s->rgba : sys->default_rgba;
 			}
 		}
 	}

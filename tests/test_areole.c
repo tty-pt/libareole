@@ -55,6 +55,27 @@ static void mock_sampler(void *user_ctx, uint16_t world, uint8_t level,
 	out->flags = (out->attr[3] > 0) ? AR_NODE_FLAG_USER0 : 0u;
 }
 
+static uint32_t s_eval_row4_calls = 0;
+
+static void mock_row_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                             int32_t wy, int32_t ox, int32_t span_w,
+                             uint32_t count, ar_sample_t *out_row)
+{
+	int32_t gdim = (count > 1u) ? (int32_t)(count - 1u) : 1;
+	for (uint32_t c = 0; c < count; c++) {
+		int32_t wx = ox + (int32_t)(((int64_t)c * span_w) / gdim);
+		mock_sampler(user_ctx, world, level, wx, wy, &out_row[c]);
+	}
+}
+
+static void mock_eval_row4(void *user_ctx, uint16_t world, uint8_t level,
+                           const int32_t wx[4], int32_t wy, ar_sample_t out[4])
+{
+	s_eval_row4_calls++;
+	for (int k = 0; k < 4; k++)
+		mock_sampler(user_ctx, world, level, wx[k], wy, &out[k]);
+}
+
 /* Mock sparsity function: reports structures only near origin [-320..320, -256..256] */
 static bool mock_sparsity(void *user_ctx, uint16_t world, uint8_t level,
                           int32_t ox, int32_t oy, int32_t w, int32_t h)
@@ -2197,6 +2218,73 @@ int main(void)
 		ar_system_destroy(full_sys);
 		printf("  [PASS] Bounded samples sub-pool verified (arena %zu -> %zu bytes, saved %.2f MB)\n",
 		       full_st.arena_bytes, cmp_st.arena_bytes, (double)saved / (1024.0 * 1024.0));
+	}
+
+	/* Test: eval_row4 bit-exact parity under parent-reuse and partial child-reuse */
+	{
+		ar_config_t ref_cfg;
+		memset(&ref_cfg, 0, sizeof(ref_cfg));
+		ref_cfg.base_w = 160;
+		ref_cfg.base_h = 128;
+		ref_cfg.grid_dim = 16;
+		ref_cfg.pool_capacity = 64;
+		ref_cfg.max_active = 32;
+		ref_cfg.max_levels = 6;
+		ref_cfg.sampler = mock_sampler;
+
+		ar_config_t simd_cfg = ref_cfg;
+		simd_cfg.row_sampler = mock_row_sampler;
+		simd_cfg.eval_row4 = mock_eval_row4;
+
+		ar_system_t *ref_sys = ar_system_create_ex(&ref_cfg);
+		ar_system_t *simd_sys = ar_system_create_ex(&simd_cfg);
+		assert(ref_sys != NULL && simd_sys != NULL);
+		s_eval_row4_calls = 0;
+
+		/* 1. Parent-reuse: ensure level 2 parent, then level 1 child */
+		const ar_node_t *p_ref = ar_system_ensure(ref_sys, 0, 2, 0, 0);
+		const ar_node_t *p_s4  = ar_system_ensure(simd_sys, 0, 2, 0, 0);
+		assert(p_ref != NULL && p_s4 != NULL);
+
+		const ar_node_t *c_ref = ar_system_ensure(ref_sys, 0, 1, 0, 0);
+		const ar_node_t *c_s4  = ar_system_ensure(simd_sys, 0, 1, 0, 0);
+		assert(c_ref != NULL && c_s4 != NULL);
+		assert(s_eval_row4_calls > 0);
+		assert(c_ref->min_val == c_s4->min_val && c_ref->max_val == c_s4->max_val);
+		assert(c_ref->flags == c_s4->flags);
+		size_t vcnt = (size_t)c_ref->vert_dim * c_ref->vert_dim;
+		for (size_t i = 0; i < vcnt; i++) {
+			assert(c_ref->values[i] == c_s4->values[i]);
+			assert(c_ref->rgba[i] == c_s4->rgba[i]);
+			assert(c_ref->samples[i].val == c_s4->samples[i].val);
+			assert(c_ref->samples[i].rgba == c_s4->samples[i].rgba);
+			assert(c_ref->samples[i].flags == c_s4->samples[i].flags);
+			assert(memcmp(c_ref->samples[i].attr, c_s4->samples[i].attr, 4) == 0);
+		}
+
+		/* 2. Partial child-reuse: ensure 1 child at level 0, then parent at level 1 */
+		uint32_t calls_before = s_eval_row4_calls;
+		assert(ar_system_ensure(ref_sys, 0, 0, 640, 512) != NULL);
+		assert(ar_system_ensure(simd_sys, 0, 0, 640, 512) != NULL);
+		const ar_node_t *u_ref = ar_system_ensure(ref_sys, 0, 1, 640, 512);
+		const ar_node_t *u_s4  = ar_system_ensure(simd_sys, 0, 1, 640, 512);
+		assert(u_ref != NULL && u_s4 != NULL);
+		assert(s_eval_row4_calls > calls_before);
+		assert(u_ref->min_val == u_s4->min_val && u_ref->max_val == u_s4->max_val);
+		assert(u_ref->flags == u_s4->flags);
+		for (size_t i = 0; i < vcnt; i++) {
+			assert(u_ref->values[i] == u_s4->values[i]);
+			assert(u_ref->rgba[i] == u_s4->rgba[i]);
+			assert(u_ref->samples[i].val == u_s4->samples[i].val);
+			assert(u_ref->samples[i].rgba == u_s4->samples[i].rgba);
+			assert(u_ref->samples[i].flags == u_s4->samples[i].flags);
+			assert(memcmp(u_ref->samples[i].attr, u_s4->samples[i].attr, 4) == 0);
+		}
+
+		ar_system_destroy(ref_sys);
+		ar_system_destroy(simd_sys);
+		printf("  [PASS] eval_row4 parent-reuse & child-reuse bit-exact parity verified (%u batch calls)\n",
+		       s_eval_row4_calls);
 	}
 
 	ar_system_destroy(cs);

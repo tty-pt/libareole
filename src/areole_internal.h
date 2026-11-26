@@ -82,6 +82,7 @@ struct ar_system {
 	int32_t           period_y;
 	ar_sampler_fn     sampler;
 	ar_row_sampler_fn row_sampler;
+	ar_eval_row4_fn   eval_row4;
 	ar_sparsity_fn    sparsity;
 	void             *user_ctx;
 	uint32_t          max_populates_per_frame;

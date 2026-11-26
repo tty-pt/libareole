@@ -106,6 +106,10 @@ typedef void (*ar_row_sampler_fn)(void *user_ctx, uint16_t world, uint8_t level,
                                   int32_t wy, int32_t ox, int32_t span_w,
                                   uint32_t count, ar_sample_t *out_row);
 
+/* Optional user-supplied 4-wide row-coherent batch sampler for sparse/reused rows */
+typedef void (*ar_eval_row4_fn)(void *user_ctx, uint16_t world, uint8_t level,
+                                const int32_t wx[4], int32_t wy, ar_sample_t out[4]);
+
 /* Optional user-supplied sparsity callback: returns true if discrete data exists */
 typedef bool (*ar_sparsity_fn)(void *user_ctx, uint16_t world, uint8_t level,
                                int32_t ox, int32_t oy, int32_t w, int32_t h);
@@ -202,6 +206,7 @@ typedef struct {
 	struct stl_wq   *wq;                   /* Optional workqueue pool for async background chunk population */
 	uint16_t         samples_pool_capacity;/* Optional cap on nodes retaining full ar_sample_t[] (0 = pool_capacity, all nodes) */
 	uint8_t          samples_max_level;    /* Max LOD level eligible for full ar_sample_t[] when samples_pool_capacity > 0 */
+	ar_eval_row4_fn  eval_row4;            /* Optional 4-wide row-coherent batch sampler for mixed reuse rows */
 } ar_config_t;
 
 #define AR_OCC_CELL_K 4u
