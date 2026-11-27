@@ -26,6 +26,7 @@ typedef struct {
 	bool    active;
 	bool    split_blocked;
 	bool    cached;
+	bool    pre_rasterized;
 } ar_candidate_t;
 
 #define AR_HYSTERESIS_GRACE_TICKS 180u

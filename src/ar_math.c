@@ -375,7 +375,15 @@ static inline float ar_projected_screen_width_box_3d(const float mvp[16],
 		           mvp[15];
 		float clip_w_thresh = (opts && opts->behind_cam_clip_w > 0.0f)
 		                      ? opts->behind_cam_clip_w : AR_DEFAULT_BEHIND_CAM_CLIP_W;
-		if (has_eye) {
+		if (opts && opts->use_lod_anchor) {
+			float dx = center_xyz[0] - opts->lod_anchor_xyz[0];
+			float dy = center_xyz[1] - opts->lod_anchor_xyz[1];
+			float dz = center_xyz[2] - opts->lod_anchor_xyz[2];
+			float cd = opts->lod_cam_dist;
+			float len_row3 = sqrtf(mvp[3]*mvp[3] + mvp[7]*mvp[7] + mvp[11]*mvp[11]);
+			float d_center = sqrtf(dx * dx + dy * dy + dz * dz + cd * cd) * len_row3;
+			w_eff = (d_center > clip_w_thresh) ? d_center : clip_w_thresh;
+		} else if (has_eye) {
 			float dx = center_xyz[0] - eye_xyz[0];
 			float dy = center_xyz[1] - eye_xyz[1];
 			float dz = center_xyz[2] - eye_xyz[2];

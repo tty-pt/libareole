@@ -809,6 +809,12 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 		active_cands[b] = key;
 	}
 
+	ar_point_3d_fn pt3d = opts ? opts->point_3d_fn : NULL;
+	void *pt3d_ctx = (opts && opts->bounds_ctx) ? opts->bounds_ctx : sys->bounds_ctx;
+
+	for (size_t i = 0; i < active_count; i++)
+		active_cands[i].pre_rasterized = false;
+
 	/* Post-split progressive populate budget:
 	 * Preserve 100% of already-cached leaves and the closest max_pops uncached leaves.
 	 * Only when uncached leaves exceed max_pops, coarsen the farthest uncached groups
@@ -827,6 +833,55 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			active_cands[i].cached = is_cached;
 			if (!is_cached)
 				uncached_total++;
+		}
+
+		/* Occlusion pre-pass before budget coarsening:
+		 * Uncached leaves hidden behind already-cached foreground ridges are never
+		 * populated (final loop culls them before ar_get_or_populate). Counting them
+		 * in uncached_total / protect_end would livelock budget coarsening and starve
+		 * visible leaves behind them. Pre-rasterize cached foreground leaves front-to-back
+		 * and drop occluded candidates before coarsening. */
+		if (uncached_total > max_pops && occ) {
+			bool can_write_occ = !(opts && opts->occluder_no_write);
+			size_t write_i = 0;
+			for (size_t i = 0; i < active_count; i++) {
+				if (ar_occ_test_padded(sys, occ, active_cands[i].b_min, active_cands[i].b_max,
+				                       occ_box_pad, occ_pad_all)) {
+					if (!active_cands[i].cached && uncached_total > 0)
+						uncached_total--;
+					continue;
+				}
+				if (active_cands[i].cached && can_write_occ) {
+					uint64_t lkey = morton_quad_key(world, active_cands[i].level,
+					                                active_cands[i].ox, active_cands[i].oy,
+					                                sys->base_w, sys->base_h);
+					uint32_t lslot = 0;
+					if (ar_map_get(sys, lkey, &lslot) &&
+					    lslot < sys->pool_capacity && sys->pool_meta[lslot].state == 1) {
+						const ar_node_t *cnode = &sys->pool[lslot];
+						uint64_t t_occ = ar_now_us(sys->timing_enabled);
+						float texel_span = (float)((cnode->w > cnode->h) ? cnode->w : cnode->h) /
+						                   (float)((cnode->grid_dim > 0) ? cnode->grid_dim : 1u);
+						float coarse_k = (cnode->grid_dim < AR_OCC_CELL_K) ? (float)cnode->grid_dim : (float)AR_OCC_CELL_K;
+						float cell_span = (float)((cnode->w > cnode->h) ? cnode->w : cnode->h) / coarse_k;
+						float node_z_bias = opts->occluder_z_bias +
+						                    texel_span * opts->occluder_texel_bias +
+						                    (cell_span * cell_span * 0.125f) * opts->occluder_concave_inv_r;
+						ar_occluder_rasterize_node(occ, cnode, sys->value_scale, node_z_bias,
+						                           pt3d, pt3d_ctx);
+						if ((cnode->flags & (AR_NODE_FLAG_SPARSE | AR_NODE_FLAG_DEFERRED)) == 0u) {
+							uint32_t k = (cnode->grid_dim < AR_OCC_CELL_K) ? cnode->grid_dim : AR_OCC_CELL_K;
+							sys->metrics.frame_occ_nodes_rasterized++;
+							sys->metrics.frame_occ_tris_rasterized += 2u * k * k + 8u * k;
+						}
+						if (sys->timing_enabled)
+							sys->metrics.us_occ_raster += (uint32_t)(ar_now_us(true) - t_occ);
+						active_cands[i].pre_rasterized = true;
+					}
+				}
+				active_cands[write_i++] = active_cands[i];
+			}
+			active_count = write_i;
 		}
 
 		while (uncached_total > max_pops) {
@@ -962,12 +1017,10 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 	}
 	sys->begin_frame_cleared_mask &= ~view_mask;
 
-	ar_point_3d_fn pt3d = opts ? opts->point_3d_fn : NULL;
-	void *pt3d_ctx = (opts && opts->bounds_ctx) ? opts->bounds_ctx : sys->bounds_ctx;
-
 	for (size_t i = 0; i < active_count && out_count < max_candidates; i++) {
-		if (occ && ar_occ_test_padded(sys, occ, active_cands[i].b_min, active_cands[i].b_max,
-		                              occ_box_pad, occ_pad_all)) {
+		if (!active_cands[i].pre_rasterized && occ &&
+		    ar_occ_test_padded(sys, occ, active_cands[i].b_min, active_cands[i].b_max,
+		                       occ_box_pad, occ_pad_all)) {
 			continue;
 		}
 
@@ -993,7 +1046,7 @@ size_t ar_system_query_matrix(ar_system_t *sys, uint16_t world,
 			if ((node->flags & AR_NODE_FLAG_DEFERRED) != 0u)
 				sys->metrics.frame_deferred_active++;
 
-			if (occ && !(opts && opts->occluder_no_write)) {
+			if (!active_cands[i].pre_rasterized && occ && !(opts && opts->occluder_no_write)) {
 				uint64_t t_occ = ar_now_us(sys->timing_enabled);
 				float texel_span = (float)((node->w > node->h) ? node->w : node->h) /
 				                   (float)((node->grid_dim > 0) ? node->grid_dim : 1u);

@@ -289,6 +289,10 @@ typedef struct {
 	bool           use_cached_bounds;     /* Tighten node [z_min, z_max] from cached min_val/max_val */
 	uint8_t        cached_bounds_max_level;/* Max LOD level eligible for cached bounds tightening */
 	float          cached_bounds_pad;     /* Extra vertical padding around cached [min_val, max_val] */
+	/* Optional yaw-invariant LOD anchor (false = measure LOD distance from camera eye_xyz) */
+	bool           use_lod_anchor;        /* Use sqrt(|center - lod_anchor_xyz|^2 + lod_cam_dist^2) for LOD splitting */
+	float          lod_anchor_xyz[3];     /* 3D orbit pivot in mvp space (e.g. (0,0,0) for focal-relative) */
+	float          lod_cam_dist;          /* Orbit distance from pivot to camera eye (yaw/pitch invariant) */
 } ar_cull_opts_t;
 
 /* Camera viewpoint and frustum descriptor */
