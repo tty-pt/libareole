@@ -169,7 +169,7 @@ int main(void)
 	/* 5. Single-pass probe hash lookup budget check */
 	ar_system_reset_frame_metrics(sys);
 	for (int i = 0; i < 1000; i++) {
-		int16_t v = 0;
+		int32_t v = 0;
 		ar_system_probe_view_val(sys, 0, 0, 100000 + i * 37, -100000 + i * 19, &v);
 	}
 	ar_metrics_t m_probe;

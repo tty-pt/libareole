@@ -117,7 +117,7 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 	size_t sample_owner_bytes = samples_bounded ? ar_align8((size_t)samples_cap * sizeof(int32_t)) : 0u;
 	size_t row_scratch_bytes = samples_bounded ? ar_align8((size_t)vert_dim * sizeof(ar_sample_t)) : 0u;
 
-	size_t per_node_vals = ar_align8((size_t)vert_count * sizeof(int16_t));
+	size_t per_node_vals = ar_align8((size_t)vert_count * sizeof(int32_t));
 	size_t per_node_rgba = ar_align8((size_t)vert_count * sizeof(uint32_t));
 	size_t per_node_samples = ar_align8((size_t)vert_count * sizeof(ar_sample_t));
 	size_t per_node_gpu_arena = per_node_vals + per_node_rgba;
@@ -172,7 +172,7 @@ ar_system_t *ar_system_create_ex(const ar_config_t *cfg)
 		sys->pool[i].grid_dim = grid_dim;
 		sys->pool[i].vert_dim = vert_dim;
 		sys->pool[i].vert_count = vert_count;
-		sys->pool[i].values = (const int16_t *)cursor;
+		sys->pool[i].values = (const int32_t *)cursor;
 		cursor += per_node_vals;
 		sys->pool[i].rgba = (const uint32_t *)cursor;
 		cursor += per_node_rgba;
@@ -358,7 +358,7 @@ void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq)
 	}
 	sys->wq = wq;
 	if (wq && !sys->staging_arena) {
-		size_t per_node_vals = ar_align8((size_t)sys->vert_count * sizeof(int16_t));
+		size_t per_node_vals = ar_align8((size_t)sys->vert_count * sizeof(int32_t));
 		size_t per_node_rgba = ar_align8((size_t)sys->vert_count * sizeof(uint32_t));
 		size_t per_node_samples = ar_align8((size_t)sys->vert_count * sizeof(ar_sample_t));
 		size_t per_node_arena = per_node_vals + per_node_rgba + per_node_samples;
@@ -368,7 +368,7 @@ void ar_system_set_wq(ar_system_t *sys, struct stl_wq *wq)
 			sys->staging_bytes = (size_t)sys->pool_capacity * per_node_arena;
 			uint8_t *cur = s_arena;
 			for (uint16_t i = 0; i < sys->pool_capacity; i++) {
-				sys->pool_meta[i].staging_values = (int16_t *)cur;
+				sys->pool_meta[i].staging_values = (int32_t *)cur;
 				cur += per_node_vals;
 				sys->pool_meta[i].staging_rgba = (uint32_t *)cur;
 				cur += per_node_rgba;
@@ -527,7 +527,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 	if (sys->wq && sys->staging_arena) {
 		if (ar_wq_thread_count(sys->wq) == 0u)
 			ar_wq_step(sys->wq, 4u);
-		size_t vals_bytes = (size_t)sys->vert_count * sizeof(int16_t);
+		size_t vals_bytes = (size_t)sys->vert_count * sizeof(int32_t);
 		size_t rgba_bytes = (size_t)sys->vert_count * sizeof(uint32_t);
 		size_t samp_bytes = (size_t)sys->vert_count * sizeof(ar_sample_t);
 		for (int32_t cur = sys->lru_head; cur >= 0; cur = sys->pool_meta[cur].lru_next) {
@@ -538,7 +538,7 @@ void ar_system_begin_frame(ar_system_t *sys)
 				ar_node_t *node = &sys->pool[cur];
 				if (meta->state == 1 && meta->morton_key == meta->async_key &&
 				    (node->flags & AR_NODE_FLAG_DEFERRED)) {
-					memcpy((int16_t *)node->values, meta->staging_values, vals_bytes);
+					memcpy((int32_t *)node->values, meta->staging_values, vals_bytes);
 					memcpy((uint32_t *)node->rgba, meta->staging_rgba, rgba_bytes);
 					if (node->samples && meta->staging_samples)
 						memcpy((ar_sample_t *)node->samples, meta->staging_samples, samp_bytes);

@@ -53,9 +53,9 @@ typedef struct {
 	int32_t        async_w;
 	int32_t        async_h;
 	uint32_t       async_flags;
-	int16_t        async_min_val;
-	int16_t        async_max_val;
-	int16_t       *staging_values;
+	int32_t        async_min_val;
+	int32_t        async_max_val;
+	int32_t       *staging_values;
 	uint32_t      *staging_rgba;
 	ar_sample_t   *staging_samples;
 #endif

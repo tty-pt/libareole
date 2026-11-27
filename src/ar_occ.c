@@ -155,9 +155,9 @@ static void ar_node_compute_occ_cell_min(ar_node_t *node)
 		s[c] = (c * gd) / K;
 	for (uint32_t gr = 0; gr < K; gr++) {
 		for (uint32_t gc = 0; gc < K; gc++) {
-			int16_t mn = 32767;
+			int32_t mn = INT32_MAX;
 			for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
-				const int16_t *vrow = &node->values[vy * vd];
+				const int32_t *vrow = &node->values[vy * vd];
 				for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
 					if (vrow[vx] < mn) mn = vrow[vx];
 				}
@@ -186,16 +186,16 @@ void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
 	for (uint32_t c = 0; c <= K; c++)
 		s[c] = (c * gd) / K;
 
-	int16_t cell_min_fallback[AR_OCC_CELL_K * AR_OCC_CELL_K];
-	const int16_t *cell_min;
+	int32_t cell_min_fallback[AR_OCC_CELL_K * AR_OCC_CELL_K];
+	const int32_t *cell_min;
 	if (node->occ_grid_k == K) {
 		cell_min = node->occ_cell_min;
 	} else {
 		for (uint32_t gr = 0; gr < K; gr++) {
 			for (uint32_t gc = 0; gc < K; gc++) {
-				int16_t mn = 32767;
+				int32_t mn = INT32_MAX;
 				for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
-					const int16_t *vrow = &node->values[vy * vd];
+					const int32_t *vrow = &node->values[vy * vd];
 					for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
 						if (vrow[vx] < mn) mn = vrow[vx];
 					}
@@ -216,7 +216,7 @@ void ar_occluder_rasterize_node(ar_occluder_t *occ, const ar_node_t *node,
 		for (uint32_t vc = 0; vc <= K; vc++) {
 			uint32_t c0 = (vc > 0u) ? (vc - 1u) : 0u;
 			uint32_t c1 = (vc < K)  ? vc : (K - 1u);
-			int16_t mn = 32767;
+			int32_t mn = INT32_MAX;
 			for (uint32_t gr = r0; gr <= r1; gr++) {
 				for (uint32_t gc = c0; gc <= c1; gc++) {
 					if (cell_min[gr * K + gc] < mn)

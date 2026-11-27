@@ -195,8 +195,21 @@ static void linear_ramp_sampler(void *user_ctx, uint16_t world, uint8_t level,
 	(void)world;
 	(void)level;
 	memset(out, 0, sizeof(*out));
-	out->val = (int16_t)(wx * 10 + wy);
+	out->val = (int32_t)(wx * 10 + wy);
 	out->rgba = 0xFF4080C0u;
+}
+
+static void high_range_i32_sampler(void *user_ctx, uint16_t world, uint8_t level,
+                                   int32_t wx, int32_t wy, ar_sample_t *out)
+{
+	(void)user_ctx;
+	(void)world;
+	(void)level;
+	memset(out, 0, sizeof(*out));
+	/* Produces Q28.4 values spanning roughly [-80,000 .. +160,000] (-5,000 .. +10,000 wu),
+	 * well beyond signed int16_t (±32,767). */
+	out->val = 80000 + wx * 120 - wy * 90;
+	out->rgba = 0xFFE0E8F0u;
 }
 
 struct torus_test_ctx {
@@ -2082,10 +2095,10 @@ int main(void)
 			for (uint32_t c = 0; c <= K; c++) s[c] = (c * n->grid_dim) / K;
 			for (uint32_t gr = 0; gr < K; gr++) {
 				for (uint32_t gc = 0; gc < K; gc++) {
-					int16_t mn = 32767;
+					int32_t mn = INT32_MAX;
 					for (uint32_t vy = s[gr]; vy <= s[gr + 1]; vy++) {
 						for (uint32_t vx = s[gc]; vx <= s[gc + 1]; vx++) {
-							int16_t v = n->values[vy * n->vert_dim + vx];
+							int32_t v = n->values[vy * n->vert_dim + vx];
 							if (v < mn) mn = v;
 						}
 					}
@@ -2099,7 +2112,7 @@ int main(void)
 		for (int dy = -600; dy <= 600; dy += 37) {
 			for (int dx = -600; dx <= 600; dx += 41) {
 				ar_sample_t full;
-				int16_t val_only = 0;
+				int32_t val_only = 0;
 				assert(ar_probe(p_sys, 1, dx, dy, &full));
 				assert(ar_probe_val(p_sys, 1, dx, dy, &val_only));
 				assert(val_only == full.val);
@@ -2112,7 +2125,7 @@ int main(void)
 		/* Also verify uncached far coordinate fallback parity */
 		{
 			ar_sample_t full;
-			int16_t val_only = 0;
+			int32_t val_only = 0;
 			assert(ar_probe_view(p_sys, 0, 1, 99999, -88888, &full));
 			assert(ar_probe_view_val(p_sys, 0, 1, 99999, -88888, &val_only));
 			assert(val_only == full.val);
@@ -2345,6 +2358,50 @@ int main(void)
 		ar_destroy(hcs);
 		printf("  [PASS] 180-tick rotation grace-period hysteresis verified (n=%zu, return_misses=0)\n",
 		       n_return);
+	}
+
+	/* Test 37: 32-bit scalar value range (> INT16_MAX / < INT16_MIN without wraparound) */
+	{
+		ar_config_t hi_cfg;
+		memset(&hi_cfg, 0, sizeof(hi_cfg));
+		hi_cfg.base_w = 160;
+		hi_cfg.base_h = 128;
+		hi_cfg.grid_dim = 16;
+		hi_cfg.pool_capacity = 64;
+		hi_cfg.max_active = 32;
+		hi_cfg.max_levels = 6;
+		hi_cfg.interp_mode = AR_INTERP_LINEAR;
+		hi_cfg.sampler = high_range_i32_sampler;
+		ar_system_t *hi_sys = ar_system_create_ex(&hi_cfg);
+		assert(hi_sys != NULL);
+		const ar_node_t *n_hi = ar_system_ensure(hi_sys, 0, 0, 0, 0);
+		assert(n_hi != NULL && n_hi->values != NULL);
+		/* Corner (0,0) = 80000, corner (160,0) = 99200, corner (0,128) = 68480, corner (160,128) = 87680 */
+		assert(n_hi->min_val == 68480);
+		assert(n_hi->max_val == 99200);
+		assert(n_hi->values[0] == 80000);
+		assert(n_hi->values[16] == 99200);
+		assert(n_hi->occ_grid_k > 0);
+		assert(n_hi->occ_cell_min[0] >= n_hi->min_val && n_hi->occ_cell_min[0] <= n_hi->max_val);
+
+		/* Negative deep-trench node below -32768 */
+		const ar_node_t *n_lo = ar_system_ensure(hi_sys, 0, 0, -1600, 0);
+		assert(n_lo != NULL && n_lo->min_val < -100000 && n_lo->max_val < -80000);
+
+		/* Probing & float conversion roundtrip at +5,500 wu (88,000 Q28.4) */
+		int32_t pv = 0;
+		ar_sample_t ps;
+		assert(ar_probe_val(hi_sys, 0, 80, 64, &pv));
+		assert(ar_probe(hi_sys, 0, 80, 64, &ps));
+		int32_t expected = 80000 + 80 * 120 - 64 * 90; /* 83840 */
+		assert(pv == expected && ps.val == expected);
+		float wf = ar_value_to_float(pv);
+		assert(fabsf(wf - ((float)expected / 16.0f)) < 1e-4f);
+		assert(ar_value_from_float(wf) == expected);
+
+		ar_destroy(hi_sys);
+		printf("  [PASS] 32-bit scalar range verified (min=%d, max=%d, deep<-100k, probe=%d, sizeof(ar_sample_t)=%zu)\n",
+		       68480, 99200, pv, sizeof(ar_sample_t));
 	}
 
 	ar_system_destroy(cs);

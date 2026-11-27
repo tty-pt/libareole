@@ -91,7 +91,7 @@ typedef float (*ar_interp_fn)(float t);
 
 /* Generic sample data evaluated at each grid vertex */
 typedef struct {
-	int16_t  val;                      /* Generic scalar displacement / field value */
+	int32_t  val;                      /* Generic scalar displacement / field value */
 	uint32_t rgba;                     /* Packed 32-bit color or RGBA attributes */
 	uint32_t flags;                    /* Generic bitmask flags (bits 0..30 user-defined; bit 31 reserved for AR_NODE_FLAG_SPARSE) */
 	uint8_t  attr[AR_SAMPLE_ATTR_CAP]; /* Generic application attribute payload */
@@ -218,8 +218,8 @@ typedef struct {
 	uint8_t            level;           /* Hierarchy level (0 = base scale) */
 	uint16_t           world;           /* World / layer identifier */
 	uint32_t           flags;           /* Aggregated node bitmask */
-	int16_t            min_val;         /* Minimum scalar value in node */
-	int16_t            max_val;         /* Maximum scalar value in node */
+	int32_t            min_val;         /* Minimum scalar value in node */
+	int32_t            max_val;         /* Maximum scalar value in node */
 	uint32_t           rev;             /* Content revision counter */
 	uint16_t           grid_dim;        /* Runtime grid_dim for this node */
 	uint16_t           vert_dim;        /* Runtime vert_dim (grid_dim + 1) */
@@ -227,10 +227,10 @@ typedef struct {
 
 	/* Precomputed coarse conservative cell minima for fast software occlusion */
 	uint8_t            occ_grid_k;      /* 0 = uncomputed, else <= AR_OCC_CELL_K */
-	int16_t            occ_cell_min[AR_OCC_CELL_K * AR_OCC_CELL_K];
+	int32_t            occ_cell_min[AR_OCC_CELL_K * AR_OCC_CELL_K];
 
 	/* Read-only pointers into the single contiguous arena allocated by ar_system_create_ex */
-	const int16_t     *values;          /* [vert_count] scalar values for zero-copy GPU upload */
+	const int32_t     *values;          /* [vert_count] scalar values for zero-copy GPU upload */
 	const uint32_t    *rgba;            /* [vert_count] packed RGBA values */
 	const ar_sample_t *samples;         /* [vert_count] full vertex samples */
 } ar_node_t;
@@ -365,8 +365,8 @@ size_t ar_system_eval_ortho_ex(ar_system_t *sys, uint8_t view_id, uint16_t world
                                const ar_ortho_opts_t *opts);
 
 float ar_system_get_value_scale(const ar_system_t *sys);
-float ar_system_value_to_float(const ar_system_t *sys, int16_t val);
-int16_t ar_system_value_from_float(const ar_system_t *sys, float val);
+float ar_system_value_to_float(const ar_system_t *sys, int32_t val);
+int32_t ar_system_value_from_float(const ar_system_t *sys, float val);
 float ar_system_level_texel_span(const ar_system_t *sys, uint8_t level);
 
 /*
@@ -434,11 +434,11 @@ bool ar_system_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t world,
 
 bool ar_system_probe_val(ar_system_t *sys, uint16_t world,
                          int32_t wx, int32_t wy,
-                         int16_t *out_val);
+                         int32_t *out_val);
 
 bool ar_system_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
                               int32_t wx, int32_t wy,
-                              int16_t *out_val);
+                              int32_t *out_val);
 
 const ar_node_t *ar_system_find(ar_system_t *sys, uint16_t world,
                                 uint8_t level, int32_t ox, int32_t oy);
@@ -536,36 +536,36 @@ static inline bool ar_probe_view(ar_system_t *sys, uint8_t view_id, uint16_t wor
 
 static inline bool ar_probe_val(ar_system_t *sys, uint16_t world,
                                 int32_t wx, int32_t wy,
-                                int16_t *out_val)
+                                int32_t *out_val)
 {
 	return ar_system_probe_val(sys, world, wx, wy, out_val);
 }
 
 static inline bool ar_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
                                      int32_t wx, int32_t wy,
-                                     int16_t *out_val)
+                                     int32_t *out_val)
 {
 	return ar_system_probe_view_val(sys, view_id, world, wx, wy, out_val);
 }
 
-static inline float ar_value_to_float_ex(int16_t val, float scale)
+static inline float ar_value_to_float_ex(int32_t val, float scale)
 {
 	float s = (scale > 0.0f) ? scale : AR_DEFAULT_VALUE_SCALE;
 	return (float)val / s;
 }
 
-static inline int16_t ar_value_from_float_ex(float val, float scale)
+static inline int32_t ar_value_from_float_ex(float val, float scale)
 {
 	float s = (scale > 0.0f) ? scale : AR_DEFAULT_VALUE_SCALE;
-	return (int16_t)(val * s);
+	return (int32_t)(val * s);
 }
 
-static inline float ar_value_to_float(int16_t val)
+static inline float ar_value_to_float(int32_t val)
 {
 	return ar_value_to_float_ex(val, AR_DEFAULT_VALUE_SCALE);
 }
 
-static inline int16_t ar_value_from_float(float val)
+static inline int32_t ar_value_from_float(float val)
 {
 	return ar_value_from_float_ex(val, AR_DEFAULT_VALUE_SCALE);
 }

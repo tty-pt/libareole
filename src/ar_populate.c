@@ -20,8 +20,8 @@ static void ar_async_populate_worker(void *ctx)
 	int32_t w = meta->async_w;
 	int32_t h = meta->async_h;
 
-	int16_t min_val = 32767;
-	int16_t max_val = -32768;
+	int32_t min_val = INT32_MAX;
+	int32_t max_val = INT32_MIN;
 	uint32_t flags = 0;
 	if (sys->sparsity) {
 		if (sys->sparsity(sys->user_ctx, world, level, ox, oy, w, h))
@@ -142,8 +142,8 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 	node->w = sys->base_w << level;
 	node->h = sys->base_h << level;
 	node->flags = 0;
-	node->min_val = 32767;
-	node->max_val = -32768;
+	node->min_val = INT32_MAX;
+	node->max_val = INT32_MIN;
 	meta->last_used_tick = sys->current_tick;
 	meta->last_touch_frame = sys->current_tick;
 	if (!upgrading)
@@ -207,7 +207,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		}
 	}
 
-	int16_t     *mut_values  = (int16_t *)node->values;
+	int32_t     *mut_values  = (int32_t *)node->values;
 	uint32_t    *mut_rgba    = (uint32_t *)node->rgba;
 	ar_sample_t *mut_samples = (ar_sample_t *)node->samples;
 
@@ -223,7 +223,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 		size_t idx = 0;
 		int vdim_p = (int32_t)parent_node->vert_dim;
 		const ar_sample_t *ps = parent_node->samples;
-		const int16_t *pv = parent_node->values;
+		const int32_t *pv = parent_node->values;
 		const uint32_t *pc_arr = parent_node->rgba;
 		for (int r = 0; r <= gdim; r++) {
 			int r_even = ((r & 1) == 0);
@@ -236,7 +236,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 				int pc1 = c_even ? pc0 : (pc0 + 1);
 				if (pc1 > gdim) pc1 = gdim;
 
-				int16_t v_out;
+				int32_t v_out;
 				uint32_t rgba_out;
 				if (mut_samples && ps) {
 					ar_sample_t *s = &mut_samples[idx];
@@ -245,7 +245,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 					} else if (r_even) {
 						const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
 						const ar_sample_t *s1 = &ps[pr0 * vdim_p + pc1];
-						s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+						s->val = (int32_t)(((int64_t)s0->val + (int64_t)s1->val) >> 1);
 						s->flags = s0->flags | s1->flags;
 						s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
 						for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
@@ -254,7 +254,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 					} else if (c_even) {
 						const ar_sample_t *s0 = &ps[pr0 * vdim_p + pc0];
 						const ar_sample_t *s1 = &ps[pr1 * vdim_p + pc0];
-						s->val = (int16_t)(((int32_t)s0->val + (int32_t)s1->val) >> 1);
+						s->val = (int32_t)(((int64_t)s0->val + (int64_t)s1->val) >> 1);
 						s->flags = s0->flags | s1->flags;
 						s->rgba = (((s0->rgba & 0xFEFEFEFEu) >> 1) + ((s1->rgba & 0xFEFEFEFEu) >> 1));
 						for (uint8_t a = 0; a < AR_SAMPLE_ATTR_CAP; a++) {
@@ -265,7 +265,7 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 						const ar_sample_t *s10 = &ps[pr0 * vdim_p + pc1];
 						const ar_sample_t *s01 = &ps[pr1 * vdim_p + pc0];
 						const ar_sample_t *s11 = &ps[pr1 * vdim_p + pc1];
-						s->val = (int16_t)(((int32_t)s00->val + (int32_t)s10->val + (int32_t)s01->val + (int32_t)s11->val) >> 2);
+						s->val = (int32_t)(((int64_t)s00->val + (int64_t)s10->val + (int64_t)s01->val + (int64_t)s11->val) >> 2);
 						s->flags = s00->flags | s10->flags | s01->flags | s11->flags;
 						s->rgba = (((s00->rgba & 0xFCFCFCFCu) >> 2) + ((s10->rgba & 0xFCFCFCFCu) >> 2) +
 						           ((s01->rgba & 0xFCFCFCFCu) >> 2) + ((s11->rgba & 0xFCFCFCFCu) >> 2));
@@ -282,16 +282,16 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 						v_out = pv[pr0 * vdim_p + pc0];
 						rgba_out = pc_arr[pr0 * vdim_p + pc0];
 					} else if (r_even) {
-						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr0 * vdim_p + pc1]) >> 1);
+						v_out = (int32_t)(((int64_t)pv[pr0 * vdim_p + pc0] + (int64_t)pv[pr0 * vdim_p + pc1]) >> 1);
 						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1) +
 						            ((pc_arr[pr0 * vdim_p + pc1] & 0xFEFEFEFEu) >> 1));
 					} else if (c_even) {
-						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr1 * vdim_p + pc0]) >> 1);
+						v_out = (int32_t)(((int64_t)pv[pr0 * vdim_p + pc0] + (int64_t)pv[pr1 * vdim_p + pc0]) >> 1);
 						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1) +
 						            ((pc_arr[pr1 * vdim_p + pc0] & 0xFEFEFEFEu) >> 1));
 					} else {
-						v_out = (int16_t)(((int32_t)pv[pr0 * vdim_p + pc0] + (int32_t)pv[pr0 * vdim_p + pc1] +
-						                   (int32_t)pv[pr1 * vdim_p + pc0] + (int32_t)pv[pr1 * vdim_p + pc1]) >> 2);
+						v_out = (int32_t)(((int64_t)pv[pr0 * vdim_p + pc0] + (int64_t)pv[pr0 * vdim_p + pc1] +
+						                   (int64_t)pv[pr1 * vdim_p + pc0] + (int64_t)pv[pr1 * vdim_p + pc1]) >> 2);
 						rgba_out = (((pc_arr[pr0 * vdim_p + pc0] & 0xFCFCFCFCu) >> 2) +
 						            ((pc_arr[pr0 * vdim_p + pc1] & 0xFCFCFCFCu) >> 2) +
 						            ((pc_arr[pr1 * vdim_p + pc0] & 0xFCFCFCFCu) >> 2) +
@@ -375,9 +375,9 @@ static ar_node_t *ar_get_or_populate(ar_system_t *sys, uint16_t world,
 				const ar_sample_t *s01 = &cgrid[cr1 * 5 + cc0];
 				const ar_sample_t *s11 = &cgrid[cr1 * 5 + cc1];
 
-				int32_t v0 = ((int32_t)s00->val * ifx + (int32_t)s10->val * fx) >> 8;
-				int32_t v1 = ((int32_t)s01->val * ifx + (int32_t)s11->val * fx) >> 8;
-				int16_t v_out = (int16_t)((v0 * ify + v1 * fy) >> 8);
+				int64_t v0 = ((int64_t)s00->val * ifx + (int64_t)s10->val * fx) >> 8;
+				int64_t v1 = ((int64_t)s01->val * ifx + (int64_t)s11->val * fx) >> 8;
+				int32_t v_out = (int32_t)((v0 * ify + v1 * fy) >> 8);
 
 				uint32_t c00 = s00->rgba, c10 = s10->rgba, c01 = s01->rgba, c11 = s11->rgba;
 				uint32_t r0 = ((c00 & 0xFFu) * (uint32_t)ifx + (c10 & 0xFFu) * (uint32_t)fx) >> 8;

@@ -63,7 +63,7 @@ static const ar_node_t *ar_probe_find_node(ar_system_t *sys, uint32_t view_mask,
 
 static bool ar_probe_val_internal(ar_system_t *sys, uint32_t view_mask, uint16_t world,
                                   int32_t wx, int32_t wy, uint8_t max_ancestor_override,
-                                  int16_t *out_val)
+                                  int32_t *out_val)
 {
 	if (!sys || !out_val)
 		return false;
@@ -94,12 +94,12 @@ static bool ar_probe_val_internal(ar_system_t *sys, uint32_t view_mask, uint16_t
 		float wu = ar_eval_interp_weight(sys, u);
 		float wv = ar_eval_interp_weight(sys, v);
 
-		const int16_t *r0 = &best_node->values[row0 * vdim + col0];
-		const int16_t *r1 = r0 + vdim;
+		const int32_t *r0 = &best_node->values[row0 * vdim + col0];
+		const int32_t *r1 = r0 + vdim;
 		float h0 = (float)r0[0] * (1.0f - wu) + (float)r0[1] * wu;
 		float h1 = (float)r1[0] * (1.0f - wu) + (float)r1[1] * wu;
 		float h  = h0 * (1.0f - wv) + h1 * wv;
-		*out_val = (int16_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
+		*out_val = (int32_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
 		if (sys->timing_enabled)
 			sys->metrics.us_probe += (uint32_t)(ar_now_us(true) - t0);
 		return true;
@@ -159,7 +159,7 @@ static bool ar_probe_internal(ar_system_t *sys, uint32_t view_mask, uint16_t wor
 		float h0 = (float)best_node->values[idx00] * (1.0f - wu) + (float)best_node->values[idx10] * wu;
 		float h1 = (float)best_node->values[idx01] * (1.0f - wu) + (float)best_node->values[idx11] * wu;
 		float h  = h0 * (1.0f - wv) + h1 * wv;
-		out->val = (int16_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
+		out->val = (int32_t)(h >= 0.0f ? (h + 0.5f) : (h - 0.5f));
 
 		uint8_t n_attr = sys->attr_count;
 		uint32_t c00, c10, c01, c11;
@@ -268,14 +268,14 @@ bool ar_system_probe(ar_system_t *sys, uint16_t world,
 
 bool ar_system_probe_val(ar_system_t *sys, uint16_t world,
                          int32_t wx, int32_t wy,
-                         int16_t *out_val)
+                         int32_t *out_val)
 {
 	return ar_probe_val_internal(sys, 0, world, wx, wy, 0, out_val);
 }
 
 bool ar_system_probe_view_val(ar_system_t *sys, uint8_t view_id, uint16_t world,
                               int32_t wx, int32_t wy,
-                              int16_t *out_val)
+                              int32_t *out_val)
 {
 	uint32_t view_mask = 1u << (view_id & 31u);
 	return ar_probe_val_internal(sys, view_mask, world, wx, wy, 0, out_val);
@@ -286,12 +286,12 @@ float ar_system_get_value_scale(const ar_system_t *sys)
 	return (sys && sys->value_scale > 0.0f) ? sys->value_scale : AR_DEFAULT_VALUE_SCALE;
 }
 
-float ar_system_value_to_float(const ar_system_t *sys, int16_t val)
+float ar_system_value_to_float(const ar_system_t *sys, int32_t val)
 {
 	return ar_value_to_float_ex(val, ar_system_get_value_scale(sys));
 }
 
-int16_t ar_system_value_from_float(const ar_system_t *sys, float val)
+int32_t ar_system_value_from_float(const ar_system_t *sys, float val)
 {
 	return ar_value_from_float_ex(val, ar_system_get_value_scale(sys));
 }
